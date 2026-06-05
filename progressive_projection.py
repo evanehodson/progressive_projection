@@ -166,55 +166,11 @@ plotter.add_on_render_callback(render_callback)
 plotter.show()
 
 # =====================================================================
-# PHASE 2: FRUSTUM CROP & COORDINATE REMAPPING
+# PHASE 2: SCREEN-SPACE FRUSTUM CROP (BULLETPROOF NDC METHOD)
 # =====================================================================
 print("\n=== Phase 2: Processing High-Resolution Dataset ===")
 
-cam_pos_world = camera_cache["position"]
-focal_world   = camera_cache["focal_point"]
-
-fov_v   = camera_cache["view_angle"]
-aspect  = camera_cache["window_size"][0] / camera_cache["window_size"][1]
-fov_h   = np.degrees(2.0 * np.arctan(np.tan(np.radians(fov_v * 0.5)) * aspect))
-
-view_dir  = focal_world - cam_pos_world
-view_dir /= np.linalg.norm(view_dir)
-up_vec    = camera_cache["up"]
-up_vec   -= (up_vec @ view_dir) * view_dir
-up_vec   /= np.linalg.norm(up_vec)
-right_vec = np.cross(view_dir, up_vec)
-
-pts      = preview_mesh.points
-to_pts   = pts - cam_pos_world
-depth    = to_pts @ view_dir
-up_proj  = to_pts @ up_vec
-rt_proj  = to_pts @ right_vec
-
-buf    = 1.0 + VIEWPORT_BUFFER
-half_h = np.tan(np.radians(fov_v * 0.5)) * depth
-half_w = np.tan(np.radians(fov_h * 0.5)) * depth
-
-in_frustum = (
-    (depth > 0) &
-    (up_proj >= -half_h * buf) & (up_proj <= half_h * buf) &
-    (rt_proj >= -half_w * buf) & (rt_proj <= half_w * buf)
-)
-visible_pts = pts[in_frustum]
-
-del preview_mesh
-plotter.close()
-del plotter
-
-if visible_pts.shape[0] == 0:
-    raise RuntimeError(
-        "Frustum crop returned 0 points. "
-        "Check CAMERA_DISTANCE / CAMERA_ALTITUDE, or widen VIEWPORT_BUFFER."
-    )
-
-v_x, v_y = visible_pts[:, 0], visible_pts[:, 1]
-buffered_x_min, buffered_x_max = v_x.min(), v_x.max()
-buffered_y_min, buffered_y_max = v_y.min(), v_y.max()
-
+# 1. Load the high-resolution production dataset completely
 print("Loading high-resolution production dataset...")
 with rasterio.open(DEM_TIF_PATH) as prod_src:
     out_height = int(prod_src.height / PRODUCTION_DOWNSAMPLE_STEP)
@@ -222,13 +178,55 @@ with rasterio.open(DEM_TIF_PATH) as prod_src:
     elevation = prod_src.read(1, out_shape=(out_height, out_width), resampling=rasterio.enums.Resampling.bilinear)
     cols, rows = np.meshgrid(np.arange(0, prod_src.width, PRODUCTION_DOWNSAMPLE_STEP)[:out_width], np.arange(0, prod_src.height, PRODUCTION_DOWNSAMPLE_STEP)[:out_height])
     xs, ys = rasterio.transform.xy(prod_src.transform, rows, cols)
-    lons = np.array(xs).reshape(out_height, out_width)
-    lats = np.array(ys).reshape(out_height, out_width)
+    lons_p = np.array(xs).reshape(out_height, out_width)
+    lats_p = np.array(ys).reshape(out_height, out_width)
 
-X_p, Y_p, Z_p, _ = run_berann_math(lons, lats, elevation)
+# 2. Run the Berann math on the entire high-res grid
+print("Applying Berann transformation matrix...")
+X_p, Y_p, Z_p, _ = run_berann_math(lons_p, lats_p, elevation)
 
-crop_mask = (X_p >= buffered_x_min) & (X_p <= buffered_x_max) & (Y_p >= buffered_y_min) & (Y_p <= buffered_y_max)
-rows_valid, cols_valid = np.where(crop_mask)
+# 3. Use PyVista's active camera matrices to extract screen-space coordinates
+# We extract the projection and view matrices from the Phase 1 plotter state
+# (Make sure 'plotter' hasn't been closed/deleted yet in Phase 1!)
+renderer = plotter.renderer
+w_w, w_h = camera_cache["window_size"]
+
+# Flatten points for matrix multiplication [N, 3]
+pts_highres = np.column_stack((X_p.ravel(), Y_p.ravel(), Z_p.ravel()))
+
+print("Projecting high-res points to screen space...")
+# Convert 3D points to Homogeneous coordinates [N, 4]
+homog_pts = np.hstack((pts_highres, np.ones((pts_highres.shape[0], 1))))
+
+# Combine View and Projection matrices
+view_matrix = np.array(renderer.GetActiveCamera().GetModelViewTransformMatrix().GetData()).reshape(4,4)
+proj_matrix = np.array(renderer.GetActiveCamera().GetProjectionTransformMatrix(w_w / w_h, -1, 1).GetData()).reshape(4,4)
+total_matrix = proj_matrix @ view_matrix
+
+# Project points to Clip Space
+clip_space = homog_pts @ total_matrix.T
+
+# Convert to Normalized Device Coordinates (NDC) by dividing by W component
+w_component = clip_space[:, 3][:, None]
+# Avoid division by zero for points behind the camera
+w_component[w_component == 0] = 1e-5
+ndc = clip_space[:, :3] / w_component
+
+# 4. Generate a mask based on what is strictly inside the viewport boundaries
+# We include your VIEWPORT_BUFFER to add padding outside the frame lines
+buf = VIEWPORT_BUFFER 
+in_view_mask = (
+    (ndc[:, 0] >= -(1.0 + buf)) & (ndc[:, 0] <= (1.0 + buf)) &  # X screen limits
+    (ndc[:, 1] >= -(1.0 + buf)) & (ndc[:, 1] <= (1.0 + buf)) &  # Y screen limits
+    (ndc[:, 2] >= 0.0) & (ndc[:, 2] <= 1.0)                    # Z depth limits (near/far clipping)
+).reshape(out_height, out_width)
+
+# Close the plotter safely now that matrices are extracted
+plotter.close()
+del plotter
+
+# 5. Extract bounding row/col indices where the terrain is actually visible
+rows_valid, cols_valid = np.where(in_view_mask)
 
 if len(rows_valid) > 0:
     r_start, r_end = rows_valid.min(), rows_valid.max() + 1
@@ -239,15 +237,17 @@ if len(rows_valid) > 0:
     Z_cropped = Z_p[r_start:r_end, c_start:c_end]
     crop_height, crop_width = X_cropped.shape
 else:
-    X_cropped, Y_cropped, Z_cropped = X_p, Y_p, Z_p
-    crop_height, crop_width = out_height, out_width
+    raise RuntimeError("Screen-space projection yielded 0 visible points. Adjust camera view.")
 
 # Center geometry around focus target
+focal_world = camera_cache["focal_point"]
+cam_pos_world = camera_cache["position"]
+
 X_centered = X_cropped - focal_world[0]
 Y_centered = Y_cropped - focal_world[1]
 Z_centered = Z_cropped - focal_world[2]
 
-# Standardize workspace units relative to PyVista real-world system range
+# Standardize workspace units
 raw_distance = np.linalg.norm(focal_world - cam_pos_world)
 SCALE_FACTOR = 10.0 / raw_distance
 
@@ -258,30 +258,22 @@ Z_final = Z_centered * SCALE_FACTOR
 # Axis swap to Y-Up convention (X, Z, -Y)
 pts_blender = np.column_stack((X_final.ravel(), Z_final.ravel(), -Y_final.ravel()))
 
-print(f"Writing {BLENDER_EXPORT_FILENAME}...")
+print(f"Writing {BLENDER_EXPORT_FILENAME} ({crop_width}x{crop_height} grid)...")
 with open(BLENDER_EXPORT_FILENAME, 'w', encoding='utf-8') as f:
     f.write("# Berann Warped Landscape\n")
-    f.write("# Blender import: File > Import > Wavefront (.obj)\n")
-    f.write("#   Forward Axis: -Z   |   Up Axis: Y\n")
-    f.write("# (Set these explicitly; they differ from Blender 4.x defaults)\n")
     np.savetxt(f, pts_blender, fmt="v %.5f %.5f %.5f")
     
     r_idx = np.arange(crop_height - 1)[:, None]
     c_idx = np.arange(crop_width - 1)
-    
     v1 = r_idx * crop_width + c_idx + 1
     v2 = v1 + 1
     v3 = (r_idx + 1) * crop_width + c_idx + 2
     v4 = v3 - 1
-    
-    # CCW winding adjustment from above to force normals upward towards your camera viewpoint
     faces = np.column_stack((v1.ravel(), v4.ravel(), v3.ravel(), v2.ravel()))
     np.savetxt(f, faces, fmt="f %d %d %d %d")
 
 cam_offset = (cam_pos_world - focal_world) * SCALE_FACTOR
+blender_cam_pos = np.array([cam_offset[0], cam_offset[2], -cam_offset[1]])
 
 print("\n=== COMPLETE ===")
-print("\n--- BLENDER CAMERA SETUP ---")
-print("Import Settings: Forward Axis = -Z  |  Up Axis = Y")
-print(f"Camera Location: X={cam_offset[0]:.4f}  Y={cam_offset[1]:.4f}  Z={cam_offset[2]:.4f}")
-print("Track To:        target Empty at (0,0,0)  |  Track Axis: -Z  |  Up: Y")
+print(f"Camera Location: X={blender_cam_pos[0]:.4f}  Y={blender_cam_pos[1]:.4f}  Z={blender_cam_pos[2]:.4f}")
