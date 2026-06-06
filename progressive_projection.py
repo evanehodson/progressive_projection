@@ -21,7 +21,7 @@ PROJECTION_MODE = "sphere"
 CAMERA_DISTANCE = 75000.0   
 CAMERA_ALTITUDE = 32000.0   
 
-# Initial Tuning Parameters Dictionary (Radius Removed)
+# Initial Tuning Parameters Dictionary (GLOBAL_Z_SCALE is hardcoded)
 params = {
     "HORIZON_COMPRESSION": 0.75,
     "ALPHA": 3.5,
@@ -37,7 +37,6 @@ PARAM_DOCS = {
     "HORIZON_COMPRESSION": "Controls horizon compression (fisheye lens scaling).\n\nLower values squeeze the distant background elements closer to the center of your view plane, while larger values stretch them back out toward the edges.",
     "ALPHA": "Swoop Amplitude Exaggeration Factor.\n\nDirectly scales the steepness and height of the progressive tilt curve. Increasing Alpha makes the background warp upward aggressively like a dramatic painted panorama.",
     "BETA": "Swoop Acceleration Curve Exponential.\n\nDetermines how abruptly the terrain tilts upward. Low values make the transition gradual across the entire map; high values keep the foreground flat and suddenly shoot the background up like a wall.",
-    "GLOBAL_Z_SCALE": "Vertical Exaggeration multiplier.\n\nPurely scales the raw elevation heights (Z-axis) of mountains and valleys uniformly across the entire DEM before any curved projections are calculated.",
     "HORIZON_LIFT_FACTOR": "Horizon lift amplifier.\n\nProgressively stretches and elevates terrain structures at the absolute furthest edges of your map field to make sure the horizon doesn't clip out of view."
 }
 
@@ -54,9 +53,7 @@ def run_berann_math(lons, lats, elevation, p):
     r_original = np.sqrt(x_metric**2 + y_metric**2)
     r_original[r_original == 0] = 1e-5
     
-    # Automatically bound max radius to full extent of dataset bounds
     r_max = r_original.max()
-
     dome_scale_meters = r_max / p["HORIZON_COMPRESSION"]
 
     if PROJECTION_MODE.lower() == "sphere":
@@ -145,7 +142,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.out_height = out_height
 
     def create_parameter_row(self, key_id, display_label, min_v, max_v, default_v, resolution=100.0):
-        """Creates a synced Row Widget container holding: Info Button, Title, Slider, and Nudge SpinBox."""
         container = QtWidgets.QWidget()
         row_lay = QtWidgets.QVBoxLayout(container)
         row_lay.setContentsMargins(0, 4, 0, 4)
@@ -201,11 +197,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return slider, spin_box
 
     def build_ui_controls(self):
-        """Constructs the side panel parameters panel (Radius elements omitted)."""
         self.c_sld, self.c_spn = self.create_parameter_row("HORIZON_COMPRESSION", "Horizon Compression", 0.1, 4.0, params["HORIZON_COMPRESSION"])
         self.a_sld, self.a_spn = self.create_parameter_row("ALPHA", "Alpha (Exaggeration Amplitude)", 0.0, 15.0, params["ALPHA"])
         self.b_sld, self.b_spn = self.create_parameter_row("BETA", "Beta (Curve Exponential)", 1.0, 6.0, params["BETA"])
-        self.z_sld, self.z_spn = self.create_parameter_row("GLOBAL_Z_SCALE", "Global Z Scale Elevation", 0.1, 10.0, params["GLOBAL_Z_SCALE"])
         self.l_sld, self.l_spn = self.create_parameter_row("HORIZON_LIFT_FACTOR", "Horizon Lift Factor", 1.0, 12.0, params["HORIZON_LIFT_FACTOR"])
         
         self.sidebar.layout().addWidget(QtWidgets.QLabel("\n" + "="*38 + "\nEXPORT TARGET CONFIGURATION"))
@@ -228,19 +222,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def init_3d_canvas(self):
         X_w, Y_w, Z_w, r_orig = run_berann_math(self.lons_preview, self.lats_preview, self.elevation_preview, params)
         
-        self.grid = pv.StructuredGrid()
-        self.grid.points = np.column_stack((X_w.ravel(), Y_w.ravel(), Z_w.ravel()))
-        self.grid.dimensions = (self.out_width, self.out_height, 1)
-        self.preview_mesh = self.grid.extract_surface(algorithm='dataset_surface')
+        # Bypassing the extract_surface filter guarantees the array indices never shift.
+        # VTK expectations: dimensions are (columns, rows, layers)
+        self.preview_mesh = pv.StructuredGrid()
+        self.preview_mesh.dimensions = (self.out_width, self.out_height, 1)
+        self.preview_mesh.points = np.column_stack((X_w.ravel(), Y_w.ravel(), Z_w.ravel()))
 
-        # ---- FIX HERE: Transpose the 2D array before flattening to match PyVista's column-first indexing ----
-        corrected_scalars = self.elevation_preview.T.ravel()
-        # --------------------------------------------------------------------------------------------------
+        # Direct, predictable flat scalar mapping
+        scalars_clean = self.elevation_preview.ravel()
 
         self.plotter_frame.set_background("dimgray")
         self.plotter_frame.add_mesh(
             self.preview_mesh, 
-            scalars=corrected_scalars, # Use the correctly ordered scalars here
+            scalars=scalars_clean, 
             cmap="terrain", 
             lighting=False, 
             show_scalar_bar=False
@@ -265,7 +259,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_mesh_geometry(self):
         X_w, Y_w, Z_w, _ = run_berann_math(self.lons_preview, self.lats_preview, self.elevation_preview, params)
-        # Keep this original simple assignment
+        
+        # Coordinates and scalar indices stay structurally mirrored forever
         self.preview_mesh.points = np.column_stack((X_w.ravel(), Y_w.ravel(), Z_w.ravel()))
         self.plotter_frame.render()
 
