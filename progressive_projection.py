@@ -22,8 +22,8 @@ params = {
     "BEZIER_P1": [0.33, 0.0],   
     "BEZIER_P2": [0.66, -0.4],  
     "BEZIER_P3": [1.0, -0.6],   
-    "BLENDER_FILENAME": "warped.obj",
-    "FLAT_FILENAME": "flat.obj"
+    "BLENDER_FILENAME": "warped.ply",
+    "FLAT_FILENAME": "flat.ply"
 }
 
 PARAM_DOCS = {
@@ -31,6 +31,58 @@ PARAM_DOCS = {
     "HORIZON_AREA_MAG": "Horizontal cross-sectional stretching factor at the horizon bounds (X/Y axis expansion).",
     "HORIZON_RELIEF_MAG": "Vertical height magnification factor applied exclusively to the grounded relief near the horizon (Z axis expansion)."
 }
+
+# ── MODULE-LEVEL HELPER FOR BINARY PLY WRITING ───────────────────────────────
+
+def write_ply_binary(path, vertices_xyz, faces_0idx, uvs=None):
+    """
+    Write a compact binary-little-endian PLY.
+    vertices_xyz : (N, 3) float32
+    faces_0idx   : (F, 4) uint32  (quads)
+    uvs          : (N, 2) float32 optional – packed into vertex element as s/t
+    """
+    n_verts = len(vertices_xyz)
+    n_faces = len(faces_0idx)
+
+    uv_header = "property float s\nproperty float t\n" if uvs is not None else ""
+    header = (
+        f"ply\n"
+        f"format binary_little_endian 1.0\n"
+        f"element vertex {n_verts}\n"
+        f"property float x\nproperty float y\nproperty float z\n"
+        f"{uv_header}"
+        f"element face {n_faces}\n"
+        f"property list uchar uint vertex_indices\n"
+        f"end_header\n"
+    ).encode("ascii")
+
+    # ── vertex block ──────────────────────────────────────────────────────────
+    if uvs is not None:
+        dtype = np.dtype([("x","<f4"),("y","<f4"),("z","<f4"),("s","<f4"),("t","<f4")])
+        vert_struct = np.empty(n_verts, dtype=dtype)
+        vert_struct["x"], vert_struct["y"], vert_struct["z"] = (
+            vertices_xyz[:,0], vertices_xyz[:,1], vertices_xyz[:,2])
+        vert_struct["s"], vert_struct["t"] = uvs[:,0], uvs[:,1]
+    else:
+        dtype = np.dtype([("x","<f4"),("y","<f4"),("z","<f4")])
+        vert_struct = np.empty(n_verts, dtype=dtype)
+        vert_struct["x"], vert_struct["y"], vert_struct["z"] = (
+            vertices_xyz[:,0], vertices_xyz[:,1], vertices_xyz[:,2])
+
+    # ── face block – vectorised, no Python loop ───────────────────────────────
+    face_dtype = np.dtype([("count","u1"),("v0","<u4"),("v1","<u4"),("v2","<u4"),("v3","<u4")])
+    face_struct = np.empty(n_faces, dtype=face_dtype)
+    face_struct["count"] = 4
+    face_struct["v0"] = faces_0idx[:,0]
+    face_struct["v1"] = faces_0idx[:,1]
+    face_struct["v2"] = faces_0idx[:,2]
+    face_struct["v3"] = faces_0idx[:,3]
+
+    with open(path, "wb") as f:
+        f.write(header)
+        f.write(vert_struct.tobytes())
+        f.write(face_struct.tobytes())
+
 
 class BezierCurveEditor(QtWidgets.QWidget):
     curveChanged = QtCore.pyqtSignal()
@@ -322,7 +374,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.layout().addWidget(QtWidgets.QLabel("Flat Reference Mesh Output Field Location:"))
         self.sidebar.layout().addWidget(self.f_file_txt)
         
-        self.bake_btn = QtWidgets.QPushButton("Bake Optimized Production OBJ")
+        self.bake_btn = QtWidgets.QPushButton("Bake Optimized Production PLY")
         self.bake_btn.setStyleSheet("background-color: #1b4d3e; color: #ffffff; font-weight: bold; font-size: 11pt; padding: 10px; border-radius: 4px;")
         self.bake_btn.clicked.connect(self.execute_highres_production_bake)
         self.sidebar.layout().addWidget(self.bake_btn)
@@ -365,105 +417,131 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_mesh.points = np.column_stack((X_w.ravel(), Y_w.ravel(), Z_w.ravel()))
         self.plotter_frame.render()
 
+    # ── COMPACT REFACTORED PLY PRODUCTION BAKE ─────────────────────────────────
+
     def execute_highres_production_bake(self):
         params["BLENDER_FILENAME"] = self.w_file_txt.text()
-        params["FLAT_FILENAME"] = self.f_file_txt.text()
+        params["FLAT_FILENAME"]    = self.f_file_txt.text()
 
-        with rasterio.open(DEM_TIF_PATH) as prod_src:
-            out_h = int(prod_src.height / PRODUCTION_DOWNSAMPLE_STEP)
-            out_w = int(prod_src.width / PRODUCTION_DOWNSAMPLE_STEP)
-            elevation_p = prod_src.read(1, out_shape=(out_h, out_w), resampling=rasterio.enums.Resampling.bilinear)
-            cols_p, rows_p = np.meshgrid(np.arange(0, prod_src.width, PRODUCTION_DOWNSAMPLE_STEP)[:out_w], np.arange(0, prod_src.height, PRODUCTION_DOWNSAMPLE_STEP)[:out_h])
-            xs_p, ys_p = rasterio.transform.xy(prod_src.transform, rows_p, cols_p)
-            lons_p, lats_p = np.array(xs_p).reshape(out_h, out_w), np.array(ys_p).reshape(out_h, out_w)
+        # ── load full-res DEM ─────────────────────────────────────────────────────
+        with rasterio.open(DEM_TIF_PATH) as src:
+            out_h = int(src.height / PRODUCTION_DOWNSAMPLE_STEP)
+            out_w = int(src.width  / PRODUCTION_DOWNSAMPLE_STEP)
+            elevation_p = src.read(1, out_shape=(out_h, out_w),
+                                   resampling=rasterio.enums.Resampling.bilinear)
+            cols_p, rows_p = np.meshgrid(
+                np.arange(0, src.width,  PRODUCTION_DOWNSAMPLE_STEP)[:out_w],
+                np.arange(0, src.height, PRODUCTION_DOWNSAMPLE_STEP)[:out_h])
+            xs_p, ys_p = rasterio.transform.xy(src.transform, rows_p, cols_p)
+            lons_p = np.array(xs_p).reshape(out_h, out_w)
+            lats_p = np.array(ys_p).reshape(out_h, out_w)
 
         X_p, Y_p, Z_p, r_p, dz_dr_p = run_berann_math(lons_p, lats_p, elevation_p, params)
 
-        X_flat_raw = (lons_p - TARGET_LON) * (111320.0 * np.cos(np.radians(TARGET_LAT)))
+        lon_scale = 111320.0 * np.cos(np.radians(TARGET_LAT))
+        X_flat_raw = (lons_p - TARGET_LON) * lon_scale
         Y_flat_raw = (lats_p - TARGET_LAT) * 111320.0
         Z_flat_raw = elevation_p * params["GLOBAL_Z"]
 
+        # ── viewport culling mask ─────────────────────────────────────────────────
         renderer = self.plotter_frame.renderer
         w_w, w_h = self.camera_cache["window_size"]
+        homog_pts = np.hstack((
+            np.column_stack((X_p.ravel(), Y_p.ravel(), Z_p.ravel())),
+            np.ones((X_p.size, 1))))
+        view_matrix = np.array(
+            renderer.GetActiveCamera().GetModelViewTransformMatrix().GetData()
+        ).reshape(4, 4)
+        proj_matrix = np.array(
+            renderer.GetActiveCamera().GetProjectionTransformMatrix(
+                w_w / w_h, -1, 1).GetData()
+        ).reshape(4, 4)
+        clip_space  = homog_pts @ (proj_matrix @ view_matrix).T
+        w_comp      = clip_space[:, 3:4]
+        w_comp[w_comp == 0] = 1e-5
+        ndc = clip_space[:, :3] / w_comp
 
-        homog_pts = np.hstack((np.column_stack((X_p.ravel(), Y_p.ravel(), Z_p.ravel())), np.ones((X_p.size, 1))))
-        view_matrix = np.array(renderer.GetActiveCamera().GetModelViewTransformMatrix().GetData()).reshape(4,4)
-        proj_matrix = np.array(renderer.GetActiveCamera().GetProjectionTransformMatrix(w_w / w_h, -1, 1).GetData()).reshape(4,4)
+        buf = VIEWPORT_BUFFER
+        in_view = (
+            (ndc[:,0] >= -(1+buf)) & (ndc[:,0] <= (1+buf)) &
+            (ndc[:,1] >= -(1+buf)) & (ndc[:,1] <= (1+buf)) &
+            (ndc[:,2] >= 0.0)      & (ndc[:,2] <= 1.0)
+        ).reshape(out_h, out_w)
 
-        clip_space = homog_pts @ (proj_matrix @ view_matrix).T
-        w_component = clip_space[:, 3][:, None]
-        w_component[w_component == 0] = 1e-5
-        ndc = clip_space[:, :3] / w_component
-
-        buf = VIEWPORT_BUFFER 
-        in_view = ((ndc[:, 0] >= -(1.0 + buf)) & (ndc[:, 0] <= (1.0 + buf)) &  
-                   (ndc[:, 1] >= -(1.0 + buf)) & (ndc[:, 1] <= (1.0 + buf)) &  
-                   (ndc[:, 2] >= 0.0) & (ndc[:, 2] <= 1.0)).reshape(out_h, out_w)
-
-        horizon_cutoff_height = params["BEZIER_P3"][1] * r_p.max()
-        above_horizon = (Z_p >= horizon_cutoff_height)
-        uncompressed = (np.abs(dz_dr_p) < 45.0)
-
-        # Combine rules into a spatial structural mask
+        horizon_cutoff   = params["BEZIER_P3"][1] * r_p.max()
+        above_horizon    = Z_p >= horizon_cutoff
+        uncompressed     = np.abs(dz_dr_p) < 45.0
         master_valid_mask = in_view & above_horizon & uncompressed
 
-        # Crop to the minimal bounding grid containing the valid items to maintain structural coordinates
         rows_valid, cols_valid = np.where(master_valid_mask)
-        if len(rows_valid) == 0: return
+        if len(rows_valid) == 0:
+            return
 
-        r_start, r_end = rows_valid.min(), rows_valid.max() + 1
-        c_start, c_end = cols_valid.min(), cols_valid.max() + 1
-        
-        X_cropped, Y_cropped, Z_cropped = X_p[r_start:r_end, c_start:c_end], Y_p[r_start:r_end, c_start:c_end], Z_p[r_start:r_end, c_start:c_end]
-        X_f_cropped, Y_f_cropped, Z_f_cropped = X_flat_raw[r_start:r_end, c_start:c_end], Y_flat_raw[r_start:r_end, c_start:c_end], Z_flat_raw[r_start:r_end, c_start:c_end]
-        crop_mask = master_valid_mask[r_start:r_end, c_start:c_end]
-        crop_height, crop_width = X_cropped.shape
+        # ── crop to tight bounding box ────────────────────────────────────────────
+        r0, r1 = rows_valid.min(), rows_valid.max() + 1
+        c0, c1 = cols_valid.min(), cols_valid.max() + 1
 
+        def crop(arr): return arr[r0:r1, c0:c1]
+
+        X_c, Y_c, Z_c         = crop(X_p), crop(Y_p), crop(Z_p)
+        Xf_c, Yf_c, Zf_c      = crop(X_flat_raw), crop(Y_flat_raw), crop(Z_flat_raw)
+        crop_mask              = crop(master_valid_mask)
+        ch, cw                 = X_c.shape
+
+        # ── build 0-indexed quad faces from structured grid ───────────────────────
+        ri = np.arange(ch - 1)[:, None]
+        ci = np.arange(cw - 1)
+        tl = ri * cw + ci
+        tr = tl + 1
+        br = tl + cw + 1
+        bl = tl + cw
+
+        all_quads   = np.column_stack((tl.ravel(), bl.ravel(), br.ravel(), tr.ravel()))
+        corner_mask = (crop_mask[ri, ci] & crop_mask[ri, ci+1] &
+                       crop_mask[ri+1, ci] & crop_mask[ri+1, ci+1]).ravel()
+        valid_quads = all_quads[corner_mask]  # shape (F, 4)
+
+        if len(valid_quads) == 0:
+            return
+
+        # ── compact vertex remapping (only write used verts) ─────────────────────
+        used_verts, inverse = np.unique(valid_quads, return_inverse=True)
+        faces_compact = inverse.reshape(-1, 4).astype(np.uint32)
+
+        # ── scale / centre ────────────────────────────────────────────────────────
         focal_world = self.camera_cache["focal_point"]
-        SCALE_FACTOR = 10.0 / np.linalg.norm(focal_world - self.camera_cache["position"])
+        SCALE = 10.0 / np.linalg.norm(focal_world - self.camera_cache["position"])
 
-        pts_blender_warped = np.column_stack((
-            (X_cropped.ravel() - focal_world[0]) * SCALE_FACTOR,
-            (Z_cropped.ravel() - focal_world[2]) * SCALE_FACTOR,
-            -((Y_cropped.ravel() - focal_world[1]) * SCALE_FACTOR)
-        ))
+        flat_verts = np.column_stack((X_c.ravel(), Y_c.ravel(), Z_c.ravel()))[used_verts]
+        warp_pts = np.column_stack((
+            (flat_verts[:,0] - focal_world[0]) * SCALE,
+            (flat_verts[:,2] - focal_world[2]) * SCALE,   # Z up → Blender Y
+            -((flat_verts[:,1] - focal_world[1]) * SCALE)
+        )).astype(np.float32)
 
+        flat_raw = np.column_stack((Xf_c.ravel(), Yf_c.ravel(), Zf_c.ravel()))[used_verts]
         row_p, col_p = np.unravel_index(np.argmin(r_p), r_p.shape)
-        pts_blender_flat = np.column_stack((
-            X_f_cropped.ravel() * SCALE_FACTOR,
-            (Z_f_cropped.ravel() - Z_flat_raw[row_p, col_p]) * SCALE_FACTOR,
-            -(Y_f_cropped.ravel() * SCALE_FACTOR)
-        ))
+        z_ref = Z_flat_raw[row_p, col_p]
+        flat_pts = np.column_stack((
+            flat_raw[:,0] * SCALE,
+            (flat_raw[:,2] - z_ref) * SCALE,
+            -(flat_raw[:,1] * SCALE)
+        )).astype(np.float32)
 
-        u, v = np.linspace(0, 1, crop_width), np.linspace(1, 0, crop_height)
+        # ── UVs ───────────────────────────────────────────────────────────────────
+        u = np.linspace(0, 1, cw)
+        v = np.linspace(1, 0, ch)
         uu, vv = np.meshgrid(u, v)
-        uv_pts = np.column_stack((uu.ravel(), vv.ravel()))
+        uv_all = np.column_stack((uu.ravel(), vv.ravel()))
+        uv_compact = uv_all[used_verts].astype(np.float32)
 
-        # Build faces based on structural mask evaluation to skip deleted points cleanly
-        r_idx, c_idx = np.arange(crop_height - 1)[:, None], np.arange(crop_width - 1)
-        v1 = r_idx * crop_width + c_idx + 1
-        v2, v3 = v1 + 1, (r_idx + 1) * crop_width + c_idx + 2
-        v4 = v3 - 1
+        # ── write ─────────────────────────────────────────────────────────────────
+        # Safe string handling if a user overrides names with custom extensions manually
+        warped_path = params["BLENDER_FILENAME"].replace(".obj", ".ply")
+        flat_path   = params["FLAT_FILENAME"].replace(".obj", ".ply")
 
-        # Evaluate if all 4 corners of a quad face survived the threshold masks
-        f1_valid = crop_mask[r_idx, c_idx]
-        f2_valid = crop_mask[r_idx, c_idx + 1]
-        f3_valid = crop_mask[r_idx + 1, c_idx + 1]
-        f4_valid = crop_mask[r_idx + 1, c_idx]
-        face_active_mask = (f1_valid & f2_valid & f3_valid & f4_valid).ravel()
-
-        faces = np.column_stack((v1.ravel(), v4.ravel(), v3.ravel(), v2.ravel()))
-        faces_filtered = faces[face_active_mask]
-        faces_obj = np.column_stack((faces_filtered[:, 0], faces_filtered[:, 0], faces_filtered[:, 1], faces_filtered[:, 1], faces_filtered[:, 2], faces_filtered[:, 2], faces_filtered[:, 3], faces_filtered[:, 3]))
-
-        for out_path, pts_data, tag in [(params["BLENDER_FILENAME"], pts_blender_warped, "Warped"), (params["FLAT_FILENAME"], pts_blender_flat, "Flat")]:
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.write(f"# Clean Production Optimized {tag} Mesh\n")
-                # Modified write format to receive explicit 2D sequences natively
-                for pt in pts_data:
-                    f.write(f"v {pt[0]:.5f} {pt[1]:.5f} {pt[2]:.5f}\n")
-                np.savetxt(f, uv_pts, fmt="vt %.5f %.5f")
-                np.savetxt(f, faces_obj, fmt="f %d/%d %d/%d %d/%d %d/%d")
+        write_ply_binary(warped_path, warp_pts, faces_compact, uv_compact)
+        write_ply_binary(flat_path,   flat_pts, faces_compact, uv_compact)
 
     def closeEvent(self, event):
         self.plotter_frame.close()
