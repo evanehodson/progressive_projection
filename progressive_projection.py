@@ -34,11 +34,12 @@ HORIZON_LIFT_FACTOR = 2.2
 
 # --- PRODUCTION BLENDER EXPORT SETTINGS ---
 BLENDER_EXPORT_FILENAME = "cottonwood_warped_for_blender.obj"
+FLAT_EXPORT_FILENAME = "cottonwood_flat_for_bake.obj"
 
 # --- LITE VIEWPORT LIGHTING RIG CONTROLS ---
 SUN_INTENSITY = 1.45   
 RIM_INTENSITY = 0.65   
-FILL_INTENSITY = 0.05  
+FILL_INTENSITY = 0.05   
 
 CAMERA_DISTANCE = 75000.0   
 CAMERA_ALTITUDE = 32000.0   
@@ -166,11 +167,10 @@ plotter.add_on_render_callback(render_callback)
 plotter.show()
 
 # =====================================================================
-# PHASE 2: SCREEN-SPACE FRUSTUM CROP (BULLETPROOF NDC METHOD)
+# PHASE 2: SCREEN-SPACE FRUSTUM CROP & COMPANION EXPORT
 # =====================================================================
 print("\n=== Phase 2: Processing High-Resolution Dataset ===")
 
-# 1. Load the high-resolution production dataset completely
 print("Loading high-resolution production dataset...")
 with rasterio.open(DEM_TIF_PATH) as prod_src:
     out_height = int(prod_src.height / PRODUCTION_DOWNSAMPLE_STEP)
@@ -181,96 +181,121 @@ with rasterio.open(DEM_TIF_PATH) as prod_src:
     lons_p = np.array(xs).reshape(out_height, out_width)
     lats_p = np.array(ys).reshape(out_height, out_width)
 
-# 2. Run the Berann math on the entire high-res grid
 print("Applying Berann transformation matrix...")
-X_p, Y_p, Z_p, _ = run_berann_math(lons_p, lats_p, elevation)
+X_p, Y_p, Z_p, r_p = run_berann_math(lons_p, lats_p, elevation)
 
-# 3. Use PyVista's active camera matrices to extract screen-space coordinates
-# We extract the projection and view matrices from the Phase 1 plotter state
-# (Make sure 'plotter' hasn't been closed/deleted yet in Phase 1!)
+# Extract raw metric coordinates for the flat companion mesh
+lon_to_meters = 111320.0 * np.cos(np.radians(TARGET_LAT))
+lat_to_meters = 111320.0
+X_flat_raw = (lons_p - TARGET_LON) * lon_to_meters
+Y_flat_raw = (lats_p - TARGET_LAT) * lat_to_meters
+Z_flat_raw = elevation * GLOBAL_Z_SCALE
+
 renderer = plotter.renderer
 w_w, w_h = camera_cache["window_size"]
 
-# Flatten points for matrix multiplication [N, 3]
 pts_highres = np.column_stack((X_p.ravel(), Y_p.ravel(), Z_p.ravel()))
-
-print("Projecting high-res points to screen space...")
-# Convert 3D points to Homogeneous coordinates [N, 4]
 homog_pts = np.hstack((pts_highres, np.ones((pts_highres.shape[0], 1))))
 
-# Combine View and Projection matrices
 view_matrix = np.array(renderer.GetActiveCamera().GetModelViewTransformMatrix().GetData()).reshape(4,4)
 proj_matrix = np.array(renderer.GetActiveCamera().GetProjectionTransformMatrix(w_w / w_h, -1, 1).GetData()).reshape(4,4)
 total_matrix = proj_matrix @ view_matrix
 
-# Project points to Clip Space
+print("Projecting high-res points to screen space...")
 clip_space = homog_pts @ total_matrix.T
-
-# Convert to Normalized Device Coordinates (NDC) by dividing by W component
 w_component = clip_space[:, 3][:, None]
-# Avoid division by zero for points behind the camera
 w_component[w_component == 0] = 1e-5
 ndc = clip_space[:, :3] / w_component
 
-# 4. Generate a mask based on what is strictly inside the viewport boundaries
-# We include your VIEWPORT_BUFFER to add padding outside the frame lines
 buf = VIEWPORT_BUFFER 
 in_view_mask = (
-    (ndc[:, 0] >= -(1.0 + buf)) & (ndc[:, 0] <= (1.0 + buf)) &  # X screen limits
-    (ndc[:, 1] >= -(1.0 + buf)) & (ndc[:, 1] <= (1.0 + buf)) &  # Y screen limits
-    (ndc[:, 2] >= 0.0) & (ndc[:, 2] <= 1.0)                    # Z depth limits (near/far clipping)
+    (ndc[:, 0] >= -(1.0 + buf)) & (ndc[:, 0] <= (1.0 + buf)) &  
+    (ndc[:, 1] >= -(1.0 + buf)) & (ndc[:, 1] <= (1.0 + buf)) &  
+    (ndc[:, 2] >= 0.0) & (ndc[:, 2] <= 1.0)                    
 ).reshape(out_height, out_width)
 
-# Close the plotter safely now that matrices are extracted
 plotter.close()
 del plotter
 
-# 5. Extract bounding row/col indices where the terrain is actually visible
 rows_valid, cols_valid = np.where(in_view_mask)
 
 if len(rows_valid) > 0:
     r_start, r_end = rows_valid.min(), rows_valid.max() + 1
     c_start, c_end = cols_valid.min(), cols_valid.max() + 1
     
+    # Crop Warped Mesh
     X_cropped = X_p[r_start:r_end, c_start:c_end]
     Y_cropped = Y_p[r_start:r_end, c_start:c_end]
     Z_cropped = Z_p[r_start:r_end, c_start:c_end]
+    
+    # Crop Flat Mesh using identical index boundaries
+    X_f_cropped = X_flat_raw[r_start:r_end, c_start:c_end]
+    Y_f_cropped = Y_flat_raw[r_start:r_end, c_start:c_end]
+    Z_f_cropped = Z_flat_raw[r_start:r_end, c_start:c_end]
+    
     crop_height, crop_width = X_cropped.shape
 else:
     raise RuntimeError("Screen-space projection yielded 0 visible points. Adjust camera view.")
 
-# Center geometry around focus target
+# Center and scale math
 focal_world = camera_cache["focal_point"]
 cam_pos_world = camera_cache["position"]
-
-X_centered = X_cropped - focal_world[0]
-Y_centered = Y_cropped - focal_world[1]
-Z_centered = Z_cropped - focal_world[2]
-
-# Standardize workspace units
 raw_distance = np.linalg.norm(focal_world - cam_pos_world)
 SCALE_FACTOR = 10.0 / raw_distance
 
-X_final = X_centered * SCALE_FACTOR
-Y_final = Y_centered * SCALE_FACTOR
-Z_final = Z_centered * SCALE_FACTOR
+# Finalize Warped Positions
+X_final = (X_cropped - focal_world[0]) * SCALE_FACTOR
+Y_final = (Y_cropped - focal_world[1]) * SCALE_FACTOR
+Z_final = (Z_cropped - focal_world[2]) * SCALE_FACTOR
+pts_blender_warped = np.column_stack((X_final.ravel(), Z_final.ravel(), -Y_final.ravel()))
 
-# Axis swap to Y-Up convention (X, Z, -Y)
-pts_blender = np.column_stack((X_final.ravel(), Z_final.ravel(), -Y_final.ravel()))
+# Finalize Flat Positions (Centered around target projection base)
+row_p, col_p = np.unravel_index(np.argmin(r_p), r_p.shape)
+target_elev_p = Z_flat_raw[row_p, col_p]
 
+X_f_final = X_f_cropped * SCALE_FACTOR
+Y_f_final = Y_f_cropped * SCALE_FACTOR
+Z_f_final = (Z_f_cropped - target_elev_p) * SCALE_FACTOR
+pts_blender_flat = np.column_stack((X_f_final.ravel(), Z_f_final.ravel(), -Y_f_final.ravel()))
+
+# Generate Normalized UV Texture Coordinates (Inverted V for standard GIS image alignment)
+u = np.linspace(0, 1, crop_width)
+v = np.linspace(1, 0, crop_height)
+uu, vv = np.meshgrid(u, v)
+uv_pts = np.column_stack((uu.ravel(), vv.ravel()))
+
+# Generate Faces Grid Index
+r_idx = np.arange(crop_height - 1)[:, None]
+c_idx = np.arange(crop_width - 1)
+v1 = r_idx * crop_width + c_idx + 1
+v2 = v1 + 1
+v3 = (r_idx + 1) * crop_width + c_idx + 2
+v4 = v3 - 1
+faces = np.column_stack((v1.ravel(), v4.ravel(), v3.ravel(), v2.ravel()))
+
+# Double the columns to link vertex indices directly to matching UV indices (v/vt)
+faces_obj = np.column_stack((
+    faces[:, 0], faces[:, 0],
+    faces[:, 1], faces[:, 1],
+    faces[:, 2], faces[:, 2],
+    faces[:, 3], faces[:, 3]
+))
+
+# Export Warped Production Mesh
 print(f"Writing {BLENDER_EXPORT_FILENAME} ({crop_width}x{crop_height} grid)...")
 with open(BLENDER_EXPORT_FILENAME, 'w', encoding='utf-8') as f:
-    f.write("# Berann Warped Landscape\n")
-    np.savetxt(f, pts_blender, fmt="v %.5f %.5f %.5f")
-    
-    r_idx = np.arange(crop_height - 1)[:, None]
-    c_idx = np.arange(crop_width - 1)
-    v1 = r_idx * crop_width + c_idx + 1
-    v2 = v1 + 1
-    v3 = (r_idx + 1) * crop_width + c_idx + 2
-    v4 = v3 - 1
-    faces = np.column_stack((v1.ravel(), v4.ravel(), v3.ravel(), v2.ravel()))
-    np.savetxt(f, faces, fmt="f %d %d %d %d")
+    f.write("# Berann Warped Landscape with Native UVs\n")
+    np.savetxt(f, pts_blender_warped, fmt="v %.5f %.5f %.5f")
+    np.savetxt(f, uv_pts, fmt="vt %.5f %.5f")
+    np.savetxt(f, faces_obj, fmt="f %d/%d %d/%d %d/%d %d/%d")
+
+# Export Flat Companion Mesh
+print(f"Writing {FLAT_EXPORT_FILENAME}...")
+with open(FLAT_EXPORT_FILENAME, 'w', encoding='utf-8') as f:
+    f.write("# Companion Flat-Base Landscape for Lighting Bakes\n")
+    np.savetxt(f, pts_blender_flat, fmt="v %.5f %.5f %.5f")
+    np.savetxt(f, uv_pts, fmt="vt %.5f %.5f")
+    np.savetxt(f, faces_obj, fmt="f %d/%d %d/%d %d/%d %d/%d")
 
 cam_offset = (cam_pos_world - focal_world) * SCALE_FACTOR
 blender_cam_pos = np.array([cam_offset[0], cam_offset[2], -cam_offset[1]])
