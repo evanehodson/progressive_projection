@@ -233,10 +233,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.grid.dimensions = (self.out_width, self.out_height, 1)
         self.preview_mesh = self.grid.extract_surface(algorithm='dataset_surface')
 
+        # ---- FIX HERE: Transpose the 2D array before flattening to match PyVista's column-first indexing ----
+        corrected_scalars = self.elevation_preview.T.ravel()
+        # --------------------------------------------------------------------------------------------------
+
         self.plotter_frame.set_background("dimgray")
         self.plotter_frame.add_mesh(
             self.preview_mesh, 
-            scalars=self.elevation_preview.ravel(), 
+            scalars=corrected_scalars, # Use the correctly ordered scalars here
             cmap="terrain", 
             lighting=False, 
             show_scalar_bar=False
@@ -261,6 +265,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_mesh_geometry(self):
         X_w, Y_w, Z_w, _ = run_berann_math(self.lons_preview, self.lats_preview, self.elevation_preview, params)
+        # Keep this original simple assignment
         self.preview_mesh.points = np.column_stack((X_w.ravel(), Y_w.ravel(), Z_w.ravel()))
         self.plotter_frame.render()
 
