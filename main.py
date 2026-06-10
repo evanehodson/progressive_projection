@@ -191,6 +191,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def handle_worker_finished(self, success, error_message):
         self.loading_overlay.set_value(100)
+        print(f"[MAIN WINDOW] Loader finished thread execution. Success Flag={success}")
+        sys.stdout.flush()
         
         if not success:
             QtWidgets.QMessageBox.critical(self, "Pipeline Load Failure", f"An error occurred during disk streaming:\n\n{error_message}")
@@ -201,21 +203,35 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.processEvents()
 
         try:
+            print(f"[MAIN WINDOW] Computing minimap DEM context arrays...")
             self.minimap.compute_dem_from_downsampled(self.pipeline.lightweight_points)
             
-            xmin, xmax, ymin, ymax, _, _ = self.pipeline.mesh.bounds
+            xmin, xmax, ymin, ymax, zmin, zmax = self.pipeline.mesh.bounds
+            print(f"[MAIN WINDOW] Loaded Data Spatial Constraints:")
+            print(f"    -> X Bounds: {xmin} to {xmax}")
+            print(f"    -> Y Bounds: {ymin} to {ymax}")
+            print(f"    -> Z Bounds: {zmin} to {zmax}")
+            sys.stdout.flush()
+
             diagonal = np.sqrt((xmax - xmin)**2 + (ymax - ymin)**2)
             
             self._block_updates = True
             self.curves.calibrate_ranges(diagonal)
             self._block_updates = False
 
+            print("[MAIN WINDOW] Handing dataset reference off to pyvista.Plotter.add_mesh()...")
             self.pipeline.mesh_actor = self.plotter.add_mesh(
                 self.pipeline.mesh,
                 show_scalar_bar=False,
                 rgb=False,
                 scalars="Hillshade"
             )
+            
+            if self.pipeline.mesh_actor is None:
+                print("[FATAL DIAGNOSTIC] pyvista.Plotter.add_mesh returned a completely NULL actor object reference!")
+            else:
+                print(f"[MAIN WINDOW] Actor wrapped successfully. Class={self.pipeline.mesh_actor.GetClassName()}")
+            sys.stdout.flush()
 
             prop = self.pipeline.mesh_actor.GetProperty()
             prop.SetLighting(True)
@@ -228,9 +244,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self.pipeline._inject_shaders()
             self.pipeline.update_hardware_lut()
+            
+            print("[MAIN WINDOW] Requesting plotter to automatically reset view matrix onto actor bounds...")
+            self.plotter.reset_camera()
+            print(f"[MAIN WINDOW] Camera state post-reset: Pos={self.plotter.camera.position}, Focus={self.plotter.camera.focal_point}")
+            
             self.route_hardware_updates()
 
         except Exception as rendering_err:
+            print(f"[CRITICAL ERROR EXCEPTION] Failure during pipeline canvas layout build: {rendering_err}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
             QtWidgets.QMessageBox.critical(self, "GPU Mapping Error", f"Failed to instantiate render properties:\n\n{rendering_err}")
 
         self.import_action.setEnabled(True)
@@ -245,25 +270,39 @@ class MainWindow(QtWidgets.QMainWindow):
     def route_hardware_updates(self):
         if self._block_updates or not self.pipeline.mesh or not self.pipeline.mesh_actor: return
         
+        # 1. Fetch current user controls
         cx, cy = self.minimap.get_mesh_coords()
         amp = float(self.curves.amp_slider.value())
         decay = float(self.curves.decay_slider.value() / 10.0)
-        alt = float(self.curves.alt_slider.value())
+        
+        # Pull slider value safely to scale camera elevation proportionally
+        alt_factor = float(self.curves.alt_slider.value() / 100.0)
+        if alt_factor <= 0: alt_factor = 0.1
 
-        xmin, xmax, ymin, ymax, _, _ = self.pipeline.mesh.bounds
+        # 2. Extract bounding radius constraints
+        xmin, xmax, ymin, ymax, zmin, zmax = self.pipeline.mesh.bounds
         corners = np.array([[xmin, ymin], [xmin, ymax], [xmax, ymin], [xmax, ymax]])
         max_dist = float(np.max(np.sqrt((corners[:, 0] - cx)**2 + (corners[:, 1] - cy)**2)))
         if max_dist <= 0: max_dist = 1.0
 
+        # 3. Stream uniform parameters straight to the hardware actor shader uniforms
         self.pipeline.update_shader_uniforms(cx, cy, max_dist, amp, decay)
 
+        # 4. Handle proportional view matrix tracking
         pts = self.pipeline.lightweight_points
         center_idx = np.argmin((pts[:, 0] - cx)**2 + (pts[:, 1] - cy)**2)
         z_base = pts[center_idx, 2]
         
-        self.plotter.camera.position = (cx, cy, z_base + alt)
+        # Derive structural distance sizing from bounding plane diagonal layout
+        diagonal = np.sqrt((xmax - xmin)**2 + (ymax - ymin)**2)
+        camera_distance = diagonal * alt_factor
+
+        # Secure a stable bird's-eye projection centered cleanly above the target pin anchor
+        self.plotter.camera.position = (cx, cy - (camera_distance * 0.4), z_base + camera_distance)
         self.plotter.camera.focal_point = (cx, cy, z_base)
-        self.plotter.camera.up = (0.0, 1.0, 0.0)
+        self.plotter.camera.up = (0.0, 0.0, 1.0) # Maintain Z-axis upward orientation alignment
+        
+        # 5. Redraw viewport canvas
         self.plotter.render()
 
     def on_export_masks(self):

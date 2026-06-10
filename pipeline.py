@@ -22,53 +22,34 @@ class CartographicPipeline:
         self.soil_lut = self._build_soil_lookup_table("soil_color_lookup_extended_na.csv")
 
     def log(self, message):
-        print(f"[PIPELINE] {message}", flush=True)
+        # Explicit un-silenced standard out streaming for real-time console tracing
+        print(f"[PIPELINE DIAGNOSTIC] {message}")
+        sys.stdout.flush()
 
     def _build_nlcd_lookup_table(self):
         """Constructs an official multi-colored USGS NLCD lookup index."""
         lut = vtk.vtkLookupTable()
-        lut.SetNumberOfTableValues(256) # Expand space safely to handle any dense byte labels
+        lut.SetNumberOfTableValues(256) 
         lut.Build()
-        
-        # Default fallback for unmapped cells (Dark Slate)
         for i in range(256):
             lut.SetTableValue(i, 0.12, 0.16, 0.23, 1.0)
             
-        # Official Federal NLCD Categorical RGB Chart mapping
         nlcd_colors = {
-            11: (70, 107, 159),    # Open Water (Deep Blue)
-            12: (209, 222, 248),   # Perennial Ice/Snow (Ice Blue)
-            21: (222, 197, 197),   # Developed, Open Space (Soft Pink)
-            22: (217, 146, 130),   # Developed, Low Intensity (Salmon)
-            23: (235, 0, 0),       # Developed, Medium Intensity (Red)
-            24: (171, 0, 0),       # Developed, High Intensity (Dark Red)
-            31: (179, 172, 159),   # Barren Land (Rock/Sand/Clay)
-            41: (104, 171, 95),    # Deciduous Forest (Bright Green)
-            42: (28, 95, 44),      # Evergreen Forest (Dark Alpine Green)
-            43: (181, 197, 143),   # Mixed Forest (Light Olive)
-            52: (204, 184, 121),   # Shrub/Scrub (Tan/Sage)
-            71: (223, 223, 194),   # Grassland/Herbaceous (Dry Straw)
-            81: (220, 217, 57),    # Pasture/Hay (Yellow Gold)
-            82: (171, 108, 40),    # Cultivated Crops (Brownish Orange)
-            90: (184, 217, 235),   # Woody Wetlands (Teal Blue)
-            95: (108, 159, 184)    # Emergent Herbaceous Wetlands (Soft Teal)
+            11: (70, 107, 159), 12: (209, 222, 248), 21: (222, 197, 197),
+            22: (217, 146, 130), 23: (235, 0, 0), 24: (171, 0, 0),
+            31: (179, 172, 159), 41: (104, 171, 95), 42: (28, 95, 44),
+            43: (181, 197, 143), 52: (204, 184, 121), 71: (223, 223, 194),
+            81: (220, 217, 57), 82: (171, 108, 40), 90: (184, 217, 235),
+            95: (108, 159, 184)
         }
-        
         for code, rgb in nlcd_colors.items():
             lut.SetTableValue(code, rgb[0]/255.0, rgb[1]/255.0, rgb[2]/255.0, 1.0)
-            
         lut.SetTableRange(0, 255)
         return lut
 
     def _build_soil_lookup_table(self, csv_path):
-        """
-        Parses the soil color table by positional columns, completely stripping 
-        negative CSV sentinel values before they reach the VTK hardware layer.
-        """
         lut = vtk.vtkLookupTable()
-        
         if not os.path.exists(csv_path):
-            self.log(f"WARNING: '{csv_path}' missing. Generating fallback earth tones.")
             lut.SetNumberOfTableValues(256)
             lut.Build()
             for i in range(256):
@@ -78,75 +59,44 @@ class CartographicPipeline:
             return lut
 
         mapping = {}
-        target_slice = 125  # Matches your specific 125 cm depth layer selection
-
+        target_slice = 125  
         with open(csv_path, mode='r', encoding='utf-8') as f:
-            header = f.readline() 
-            
+            f.readline() 
             for line in f:
-                if not line.strip():
-                    continue
-                
+                if not line.strip(): continue
                 parts = [p.strip() for p in line.split(',')]
-                if len(parts) < 7:
-                    continue
-                    
+                if len(parts) < 7: continue
                 try:
                     row_slice = int(float(parts[3]))
-                    
                     if row_slice == target_slice:
                         code = int(float(parts[1]))
-                        
-                        # CRITICAL FIX: Skip negative IDs (-99) right here in Python
-                        # so they never get passed to vtkLookupTable's indexer
-                        if code < 0:
-                            continue
-                            
-                        r = int(float(parts[4]))
-                        g = int(float(parts[5]))
-                        b = int(float(parts[6]))
-                        
-                        mapping[code] = (r, g, b)
-                except (ValueError, IndexError):
-                    continue
+                        if code < 0: continue
+                        mapping[code] = (int(float(parts[4])), int(float(parts[5])), int(float(parts[6])))
+                except (ValueError, IndexError): continue
 
         if not mapping:
-            self.log(f"WARNING: No soil rows matched depth slice {target_slice} cm.")
             lut.SetNumberOfTableValues(256)
             lut.Build()
             return lut
 
-        self.log(f"Successfully mapped {len(mapping)} soil color profiles specifically for depth: {target_slice} cm.")
-
-        # Filter out the 65535 mask value when evaluating our maximum index layout size
         valid_codes = [c for c in mapping.keys() if c < 60000]
         max_real_code = max(valid_codes) if valid_codes else 255
-        
-        # Allocate our table array size up to the highest valid code encountered
         lut.SetNumberOfTableValues(max_real_code + 1)
         lut.Build()
-
-        # Fill the table range with a natural muted clay/loam loam brown base tint
         for i in range(max_real_code + 1):
             lut.SetTableValue(i, 0.46, 0.41, 0.37, 1.0)
-
-        # Inject real color entries into their matching sequential index addresses
         for code, rgb in mapping.items():
             if 0 <= code <= max_real_code:
                 lut.SetTableValue(code, rgb[0]/255.0, rgb[1]/255.0, rgb[2]/255.0, 1.0)
-
         return lut
 
     def load_mesh(self, file_path, plotter, progress_callback=None):
         def update_progress(val, message):
-            if progress_callback:
-                progress_callback(val, message)
+            if progress_callback: progress_callback(val, message)
 
+        self.log(f"Starting execution loop for file: {file_path}")
         update_progress(0, "Opening PLY asset architecture...")
 
-        # -----------------------------------------------------------------
-        # 1. HEADER PARSING
-        # -----------------------------------------------------------------
         num_vertices = None
         num_faces = None
         header_offset = None
@@ -155,8 +105,7 @@ class CartographicPipeline:
             header_bytes = b""
             while b"end_header" not in header_bytes:
                 line = f.readline()
-                if not line:
-                    break
+                if not line: break
                 header_bytes += line
                 line_str = line.decode('ascii', errors='ignore').strip()
                 if line_str.startswith("element vertex"):
@@ -168,11 +117,9 @@ class CartographicPipeline:
         if num_vertices is None or num_faces is None or header_offset is None:
             raise ValueError("[FATAL] Malformed PLY file structure.")
 
+        self.log(f"Parsed Header Header Offset={header_offset} bytes | Vertices={num_vertices:,} | Faces={num_faces:,}")
         update_progress(5, f"Header mapped. Parsing {num_vertices:,} vertices...")
 
-        # -----------------------------------------------------------------
-        # 2. PARSE VERTICES
-        # -----------------------------------------------------------------
         vertex_dtype = np.dtype([
             ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
             ('nx', '<f4'), ('ny', '<f4'), ('nz', '<f4'),
@@ -181,11 +128,9 @@ class CartographicPipeline:
         v_data = np.fromfile(file_path, dtype=vertex_dtype, count=num_vertices, offset=header_offset)
         vertices = np.column_stack((v_data['x'], v_data['y'], v_data['z']))
         
+        self.log(f"Vertices read into NumPy. Memory Shape={vertices.shape}")
         update_progress(15, f"Vertices loaded. Allocating topology memory grid...")
 
-        # -----------------------------------------------------------------
-        # 3. CHUNKED FACE STRIDE PROCESSING
-        # -----------------------------------------------------------------
         face_stride = 21  
         num_corners = 3   
         face_start_offset = header_offset + (num_vertices * 28)
@@ -199,7 +144,6 @@ class CartographicPipeline:
         
         with open(file_path, 'rb') as f:
             f.seek(face_start_offset)
-            
             for i in range(chunk_count):
                 start_face = i * faces_per_chunk
                 end_face = num_faces if i == (chunk_count - 1) else (start_face + faces_per_chunk)
@@ -218,9 +162,7 @@ class CartographicPipeline:
                 current_pct = int(15 + (i / chunk_count) * 50)
                 update_progress(current_pct, f"Streaming topology block: {end_face:,} / {num_faces:,} entries")
 
-        # -----------------------------------------------------------------
-        # 4. CONSTRUCT VTK CELL LAYOUT
-        # -----------------------------------------------------------------
+        self.log("Face byte stride extraction successful.")
         update_progress(68, "Compiling flat topological grid matrix...")
         cells = np.empty((num_faces, num_corners + 1), dtype=np.int32)
         cells[:, 0] = num_corners
@@ -231,16 +173,17 @@ class CartographicPipeline:
 
         update_progress(72, "Generating solid surface geometry...")
         cells_flat = cells.ravel()
+        
+        self.log("Assembling pyvista.PolyData allocation...")
         self.mesh = pv.PolyData(vertices, cells_flat)
+        self.log(f"PolyData Mesh Created Successfully. Bounds={self.mesh.bounds}")
 
         del cells, cells_flat
         gc.collect()
 
-        # -----------------------------------------------------------------
-        # 5. ATTACH SCALAR ATTRIBUTES
-        # -----------------------------------------------------------------
         step = max(1, num_vertices // 40000)
         self.lightweight_points = vertices[::step, :].copy()
+        self.log(f"Generated lightweight downsampled tracking points. Shape={self.lightweight_points.shape}")
 
         del vertices
         gc.collect()
@@ -261,6 +204,7 @@ class CartographicPipeline:
             vtk_arr = numpy_to_vtk(channel, deep=True, array_type=vtk.VTK_FLOAT)
             vtk_arr.SetName(name)
             self.mesh.GetPointData().AddArray(vtk_arr)
+            self.log(f"Attached Point Scalar Array: '{name}'")
             del channel
 
         del rgba_float
@@ -278,25 +222,51 @@ class CartographicPipeline:
         soil_arr.SetName("soil_color")
         self.mesh.GetCellData().AddArray(soil_arr)
 
+        self.log("Categorical cell textures successfully bound to spatial context.")
         del landcover_data, soil_data, lc_contiguous, soil_contiguous
         gc.collect()
 
         update_progress(98, "Mesh loaded completely. Finalizing engine components...")
 
     def _inject_shaders(self):
-        if not self.mesh_actor: return
+        if not self.mesh_actor:
+            self.log("WARNING: Attempted _inject_shaders on a null actor reference.")
+            return
+        
+        self.log("Injecting hardware GLSL shader code block overrides into Actor custom definitions...")
         sp = self.mesh_actor.GetShaderProperty()
         sp.ClearAllShaderReplacements()
-        impl_code = """
-            float d = distance(vertexMC.xy, u_focalCenter);
-            float normDist = d / u_maxDist;
-            float verticalLift = u_amplitude * (1.0 - exp(-u_kDecay * normDist));
-            vertexMC.z += verticalLift;
+        
+        # 1. Declare custom uniform parameters in the Vertex Shader Header
+        decl_code = """
+            uniform vec2 u_focalCenter;
+            uniform float u_maxDist;
+            uniform float u_amplitude;
+            uniform float u_kDecay;
         """
-        sp.AddVertexShaderReplacement("//VTK::PositionVC::Impl", False, impl_code, False)
+        sp.AddVertexShaderReplacement("//VTK::CustomUniforms::Dec", True, decl_code, False)
+
+        # 2. Implement Progressive Warp and assign structural GLSL output variables cleanly
+        impl_code = """
+            // Calculate distance utilizing native OpenGLActor model coordinates
+            float d = distance(vertexMC.xy, u_focalCenter);
+            float normDist = clamp(d / u_maxDist, 0.0, 1.0);
+            float verticalLift = u_amplitude * (1.0 - exp(-u_kDecay * normDist));
+            
+            // Warp the local vertex positions prior to matrix space projection
+            vec4 warpedVertex = vec4(vertexMC.x, vertexMC.y, vertexMC.z + verticalLift, 1.0);
+            
+            // Assign mandatory VTK internal positional targets
+            vertexVCVSOutput = MCVCMatrix * warpedVertex;
+            gl_Position = MCDCMatrix * warpedVertex;
+        """
+        # Overriding the core positions implementation block completely replaces the native projection
+        sp.AddVertexShaderReplacement("//VTK::PositionVC::Impl", True, impl_code, False)
+        self.log("Shader strings injected successfully.")
 
     def update_shader_uniforms(self, cx, cy, max_dist, amplitude, k_decay):
         if not self.mesh_actor: return
+        
         shader_params = self.mesh_actor.GetShaderProperty().GetVertexCustomUniforms()
         shader_params.SetUniformf("u_amplitude", amplitude)
         shader_params.SetUniformf("u_kDecay", k_decay)
@@ -304,34 +274,20 @@ class CartographicPipeline:
         shader_params.SetUniformf("u_maxDist", max_dist)
 
     def update_hardware_lut(self, layer_idx=None):
-        """
-        Manages the explicit state machine transition between point fields 
-        and cell arrays to guarantee layers don't vanish.
-        """
         if layer_idx is not None:
             self.active_layer_idx = layer_idx
         
-        if not self.mesh_actor: 
-            return
+        if not self.mesh_actor: return
         
         mapper = self.mesh_actor.GetMapper()
-        layer_map = {
-            0: "Hillshade", 
-            1: "AO", 
-            2: "Texture", 
-            3: "Vegetation", 
-            4: "landcover", 
-            5: "soil_color"
-        }
+        layer_map = {0: "Hillshade", 1: "AO", 2: "Texture", 3: "Vegetation", 4: "landcover", 5: "soil_color"}
         target_array = layer_map.get(self.active_layer_idx, "Hillshade")
 
-        # ---------------------------------------------------------
-        # MODE 1: VERTEX CONTINUOUS CHANNELS (0, 1, 2, 3)
-        # ---------------------------------------------------------
+        self.log(f"Shifting hardware color mapping strategy to: {target_array} (Layer index={self.active_layer_idx})")
+
         if self.active_layer_idx in [0, 1, 2, 3]:
             mapper.SetScalarModeToUsePointFieldData()
             mapper.SelectColorArray(target_array)
-            
             lut = vtk.vtkLookupTable()
             lut.SetNumberOfTableValues(256)
             lut.SetTableRange(0.0, 1.0)
@@ -339,56 +295,43 @@ class CartographicPipeline:
                 val = idx / 255.0
                 lut.SetTableValue(idx, val, val, val, 1.0)
             lut.Build()
-            
             mapper.SetLookupTable(lut)
             mapper.SetScalarRange(0.0, 1.0)
 
-        # ---------------------------------------------------------
-        # MODE 2: LAND COVER CATEGORICAL CELLS (4)
-        # ---------------------------------------------------------
         elif self.active_layer_idx == 4:
             mapper.SetScalarModeToUseCellFieldData()
             mapper.SelectColorArray(target_array)
-            
             self.nlcd_lut.SetUseAboveRangeColor(True)
             self.nlcd_lut.SetUseBelowRangeColor(True)
             self.nlcd_lut.SetAboveRangeColor(0.12, 0.16, 0.23, 1.0)
             self.nlcd_lut.SetBelowRangeColor(0.12, 0.16, 0.23, 1.0)
-            
             mapper.SetLookupTable(self.nlcd_lut)
             mapper.SetScalarRange(0, 255)
 
-        # ---------------------------------------------------------
-        # MODE 3: SOIL MATRIX CELLS (5)
-        # ---------------------------------------------------------
         elif self.active_layer_idx == 5:
             mapper.SetScalarModeToUseCellFieldData()
             mapper.SelectColorArray(target_array)
-            
             self.soil_lut.SetUseAboveRangeColor(True)
             self.soil_lut.SetUseBelowRangeColor(True)
-            
-            fallback_dark_slate = [0.12, 0.14, 0.18, 1.0] 
+            fallback_dark_slate = [0.12, 0.14, 0.18, 1.0]
             self.soil_lut.SetAboveRangeColor(fallback_dark_slate)
             self.soil_lut.SetBelowRangeColor(fallback_dark_slate)
-            
             mapper.SetLookupTable(self.soil_lut)
             mapper.SetScalarRange(self.soil_lut.GetTableRange())
 
         mapper.Update()
         self.mesh_actor.Modified()
+        self.log("Hardware lookup update cycle completed.")
 
     def execute_multipass_export(self, plotter, base_filename="export"):
         if not self.mesh_actor: return
         plotter.render_window.SetAnimate(0)
         original_layer = self.active_layer_idx
-        
         layer_names = ["Hillshade", "AO", "Texture", "Vegetation", "Landcover", "Soil"]
         for i, name in enumerate(layer_names):
             self.update_hardware_lut(layer_idx=i)
             plotter.render()
             plotter.screenshot(f"{base_filename}_{name}.png", transparent_background=True)
-            
         self.update_hardware_lut(layer_idx=original_layer)
         plotter.render_window.SetAnimate(1)
         plotter.render()
