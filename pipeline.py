@@ -135,7 +135,6 @@ class CartographicPipeline:
             if 0 <= code <= max_real_code:
                 lut.SetTableValue(code, rgb[0]/255.0, rgb[1]/255.0, rgb[2]/255.0, 1.0)
 
-        lut.SetTableRange(0, max_real_code)
         return lut
 
     def load_mesh(self, file_path, plotter, progress_callback=None):
@@ -270,15 +269,6 @@ class CartographicPipeline:
         update_progress(90, "Deep-copying categorical data blocks...")
         lc_contiguous = np.ascontiguousarray(landcover_data, dtype=np.int32)
         soil_contiguous = np.ascontiguousarray(soil_data, dtype=np.int32)
-        
-        # =================================================================
-        # DIAGNOSTIC MONITOR: Evaluates values packed inside input binary
-        # =================================================================
-        print(f"\n[DIAGNOSTIC] Soil Face Array Values Loaded:", flush=True)
-        print(f" -> Minimum integer value: {soil_contiguous.min()}", flush=True)
-        print(f" -> Maximum integer value: {soil_contiguous.max()}", flush=True)
-        print(f" -> First 15 indices sampled: {soil_contiguous[:15]}\n", flush=True)
-        # =================================================================
 
         lc_arr = numpy_to_vtk(lc_contiguous, deep=True, array_type=vtk.VTK_INT)
         lc_arr.SetName("landcover")
@@ -339,11 +329,9 @@ class CartographicPipeline:
         # MODE 1: VERTEX CONTINUOUS CHANNELS (0, 1, 2, 3)
         # ---------------------------------------------------------
         if self.active_layer_idx in [0, 1, 2, 3]:
-            # Reset and explicitly bind to Point Data Mode
             mapper.SetScalarModeToUsePointFieldData()
             mapper.SelectColorArray(target_array)
             
-            # Rebuild a standard high-fidelity grayscale grading table
             lut = vtk.vtkLookupTable()
             lut.SetNumberOfTableValues(256)
             lut.SetTableRange(0.0, 1.0)
@@ -359,11 +347,9 @@ class CartographicPipeline:
         # MODE 2: LAND COVER CATEGORICAL CELLS (4)
         # ---------------------------------------------------------
         elif self.active_layer_idx == 4:
-            # Switch the entire hardware pipeline over to Cell Data Mode
             mapper.SetScalarModeToUseCellFieldData()
             mapper.SelectColorArray(target_array)
             
-            # Enable bounds-clipping protection for NLCD categories
             self.nlcd_lut.SetUseAboveRangeColor(True)
             self.nlcd_lut.SetUseBelowRangeColor(True)
             self.nlcd_lut.SetAboveRangeColor(0.12, 0.16, 0.23, 1.0)
@@ -376,11 +362,9 @@ class CartographicPipeline:
         # MODE 3: SOIL MATRIX CELLS (5)
         # ---------------------------------------------------------
         elif self.active_layer_idx == 5:
-            # Keep hardware pipeline in Cell Data Mode
             mapper.SetScalarModeToUseCellFieldData()
             mapper.SelectColorArray(target_array)
             
-            # Catch 65535 mask numbers and route them to deep slate
             self.soil_lut.SetUseAboveRangeColor(True)
             self.soil_lut.SetUseBelowRangeColor(True)
             
@@ -391,7 +375,6 @@ class CartographicPipeline:
             mapper.SetLookupTable(self.soil_lut)
             mapper.SetScalarRange(self.soil_lut.GetTableRange())
 
-        # Sync, compile modifications, and update the actor viewport
         mapper.Update()
         self.mesh_actor.Modified()
 
