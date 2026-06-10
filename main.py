@@ -7,8 +7,46 @@ from pipeline import CartographicPipeline
 from widgets_map import MinimapWidget
 from widgets_curves import DeformationControls
 
+class ViewportProgressOverlay(QtWidgets.QWidget):
+    """A classic, clean horizontal progress bar anchored to the bottom-center of the viewport."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(40, 0, 40, 50) # Pads away from edges, anchors 50px from bottom
+        layout.setAlignment(QtCore.Qt.AlignBottom | QtCore.Qt.AlignHCenter)
+        
+        # Classic sleek horizontal progress bar
+        self.pbar = QtWidgets.QProgressBar(self)
+        self.pbar.setFixedSize(400, 20)
+        self.pbar.setTextVisible(False)
+        self.pbar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #334155;
+                border-radius: 4px;
+                background-color: #1e293b;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #10b981;
+                border-radius: 3px;
+            }
+        """)
+        
+        layout.addWidget(self.pbar)
+        self.hide()
+
+    def set_value(self, val):
+        self.pbar.setValue(val)
+
+    def update_position(self):
+        """Maintains overlay tracking relative to viewport dimensions."""
+        if self.parent():
+            self.setGeometry(0, 0, self.parent().width(), self.parent().height())
+
 class MeshLoadWorker(QtCore.QThread):
-    """Worker thread to handle the 1.18 GB disk load without freezing the PyQt GUI."""
     progressChanged = QtCore.pyqtSignal(int, str)
     finished = QtCore.pyqtSignal(bool, str)
 
@@ -20,7 +58,6 @@ class MeshLoadWorker(QtCore.QThread):
 
     def run(self):
         try:
-            # We pass our thread's signal callback into the pipeline
             self.pipeline.load_mesh(
                 self.file_path, 
                 self.plotter, 
@@ -37,14 +74,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1500, 950)
         self.setStyleSheet("""
             QMainWindow { background-color: #0f172a; color: #f8fafc; }
+            QMenuBar { background-color: #1e293b; color: #f8fafc; font-weight: bold; border-bottom: 1px solid #334155; }
+            QMenuBar::item:selected { background-color: #2563eb; }
+            QMenu { background-color: #1e293b; color: #f8fafc; border: 1px solid #334155; }
+            QMenu::item:selected { background-color: #2563eb; }
             QGroupBox { font-weight: bold; border: 1px solid #334155; border-radius: 6px; margin-top: 8px; padding: 6px; color: #f8fafc; }
             QLabel { color: #cbd5e1; font-size: 8pt; }
-            QPushButton { background-color: #2563eb; color: white; border: none; padding: 6px; border-radius: 4px; font-weight: bold; }
-            QPushButton:hover { background-color: #3b82f6; }
-            QPushButton:disabled { background-color: #1e293b; color: #64748b; border: 1px solid #334155; }
             QComboBox { background-color: #1e293b; color: #f8fafc; border: 1px solid #334155; border-radius: 4px; padding: 4px; }
-            QProgressBar { border: 1px solid #334155; border-radius: 4px; text-align: center; background-color: #1e293b; color: white; font-weight: bold; }
-            QProgressBar::chunk { background-color: #10b981; width: 10px; }
         """)
 
         self.pipeline = CartographicPipeline()
@@ -58,48 +94,62 @@ class MainWindow(QtWidgets.QMainWindow):
         # Left Sidebar
         self.sidebar = QtWidgets.QWidget()
         self.sidebar.setFixedWidth(360)
-        sidebar_layout = QtWidgets.QVBoxLayout(self.sidebar)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        self.sidebar_layout = QtWidgets.QVBoxLayout(self.sidebar)
+        self.sidebar_layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.sidebar)
 
-        # Main Plotter
-        self.plotter = QtInteractor(self)
+        # Main Plotter Container
+        self.plotter_container = QtWidgets.QWidget()
+        plotter_layout = QtWidgets.QGridLayout(self.plotter_container)
+        plotter_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.plotter = QtInteractor(self.plotter_container)
         self.plotter.set_background("#1e293b")
         if self.plotter.iren.get_interactor_style() is not None:
-            self.plotter.iren.get_interactor_style().SetEnabled(False) # Lock standard movement
-        layout.addWidget(self.plotter)
+            self.plotter.iren.get_interactor_style().SetEnabled(False)
+            
+        plotter_layout.addWidget(self.plotter, 0, 0)
+        layout.addWidget(self.plotter_container)
 
+        # Centered inline overlay
+        self.loading_overlay = ViewportProgressOverlay(self.plotter_container)
+
+        self.create_menu_bar()
         self.build_ui()
 
-    def build_ui(self):
-        # IO Block
-        io_group = QtWidgets.QGroupBox("Mesh Entry")
-        io_layout = QtWidgets.QVBoxLayout(io_group)
-        self.load_btn = QtWidgets.QPushButton("Load Packed Face PLY...")
-        self.load_btn.clicked.connect(self.on_load_mesh)
-        self.export_btn = QtWidgets.QPushButton("Execute Multi-Pass Export")
-        self.export_btn.clicked.connect(self.on_export_masks)
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.loading_overlay.update_position()
+
+    def create_menu_bar(self):
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+
+        self.import_action = QtWidgets.QAction("&Import Packed Face PLY...", self)
+        self.import_action.setShortcut("Ctrl+I")
+        self.import_action.triggered.connect(self.on_load_mesh)
         
-        # New Progress Monitoring UI Elements
-        self.progress_bar = QtWidgets.QProgressBar()
-        self.progress_bar.setValue(0)
-        self.progress_bar.hide()
-        self.status_lbl = QtWidgets.QLabel("Ready")
-        self.status_lbl.setStyleSheet("color: #94a3b8; font-style: italic;")
+        self.export_action = QtWidgets.QAction("&Export Multi-Pass Masks...", self)
+        self.export_action.setShortcut("Ctrl+E")
+        self.export_action.setEnabled(False)  
+        self.export_action.triggered.connect(self.on_export_masks)
 
-        io_layout.addWidget(self.load_btn)
-        io_layout.addWidget(self.export_btn)
-        io_layout.addWidget(self.progress_bar)
-        io_layout.addWidget(self.status_lbl)
-        self.sidebar.layout().addWidget(io_group)
+        exit_action = QtWidgets.QAction("&Exit Studio Window", self)
+        exit_action.triggered.connect(self.close)
 
+        file_menu.addAction(self.import_action)
+        file_menu.addAction(self.export_action)
+        file_menu.addSeparator()
+        file_menu.addAction(exit_action)
+
+    def build_ui(self):
         # Minimap
         map_group = QtWidgets.QGroupBox("Focal Alignment Map")
         map_layout = QtWidgets.QVBoxLayout(map_group)
         self.minimap = MinimapWidget()
         self.minimap.centerChanged.connect(self.route_hardware_updates)
         map_layout.addWidget(self.minimap)
-        self.sidebar.layout().addWidget(map_group)
+        self.sidebar_layout.addWidget(map_group)
 
         # Deformation Controls
         warp_group = QtWidgets.QGroupBox("Funnel Geometry Deformation Curve")
@@ -107,7 +157,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.curves = DeformationControls()
         self.curves.valuesChanged.connect(self.route_hardware_updates)
         warp_layout.addWidget(self.curves)
-        self.sidebar.layout().addWidget(warp_group)
+        self.sidebar_layout.addWidget(warp_group)
         
         # Layer Selection Box
         layer_group = QtWidgets.QGroupBox("Active Rendering Layer Attribute")
@@ -116,44 +166,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.layer_combo.addItems(["Hillshade", "Ambient Occlusion", "Texture Detail", "Vegetation Cover", "Landcover Class", "Soil Color Class"])
         self.layer_combo.currentIndexChanged.connect(self.on_layer_changed)
         layer_layout.addWidget(self.layer_combo)
-        self.sidebar.layout().addWidget(layer_group)
+        self.sidebar_layout.addWidget(layer_group)
+        
+        self.sidebar_layout.addStretch()
 
     def on_load_mesh(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Target Geometry PLY", "", "PLY Meshes (*.ply)")
         if not file_path: return
         
-        # Lock buttons and display loading UI
-        self.load_btn.setEnabled(False)
-        self.export_btn.setEnabled(False)
-        self.progress_bar.setValue(0)
-        self.progress_bar.show()
-        self.status_lbl.setText("Initializing memory streams...")
+        self.import_action.setEnabled(False)
+        self.export_action.setEnabled(False)
+        
+        self.loading_overlay.set_value(0)
+        self.loading_overlay.update_position()
+        self.loading_overlay.show()
 
-        # Fire off the worker thread
         self.worker = MeshLoadWorker(self.pipeline, file_path, self.plotter)
         self.worker.progressChanged.connect(self.handle_worker_progress)
         self.worker.finished.connect(self.handle_worker_finished)
         self.worker.start()
 
     def handle_worker_progress(self, percent, message):
-        self.progress_bar.setValue(percent)
-        self.status_lbl.setText(message)
+        self.loading_overlay.set_value(percent)
 
     def handle_worker_finished(self, success, error_message):
-        self.progress_bar.setValue(100)
+        self.loading_overlay.set_value(100)
         
         if not success:
-            self.status_lbl.setText("[CRASH PREVENTED]")
             QtWidgets.QMessageBox.critical(self, "Pipeline Load Failure", f"An error occurred during disk streaming:\n\n{error_message}")
-            self.load_btn.setEnabled(True)
-            self.progress_bar.hide()
+            self.import_action.setEnabled(True)
+            self.loading_overlay.hide()
             return
 
-        self.status_lbl.setText("Binding actors to VTK Graphic Pipeline...")
         QtWidgets.QApplication.processEvents()
 
-        # Finalizing: Binding actor contexts to the viewport must happen here 
-        # inside the safe primary GUI thread
         try:
             self.minimap.compute_dem_from_downsampled(self.pipeline.lightweight_points)
             
@@ -164,7 +210,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.curves.calibrate_ranges(diagonal)
             self._block_updates = False
 
-            # Bind actual mesh object inside renderer targets
             self.pipeline.mesh_actor = self.plotter.add_mesh(
                 self.pipeline.mesh,
                 show_scalar_bar=False,
@@ -172,7 +217,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 scalars="Hillshade"
             )
 
-            # Re-apply static material shading parameters
             prop = self.pipeline.mesh_actor.GetProperty()
             prop.SetLighting(True)
             prop.SetAmbient(1.0)
@@ -185,17 +229,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pipeline._inject_shaders()
             self.pipeline.update_hardware_lut()
             self.route_hardware_updates()
-            
-            self.status_lbl.setText("Ready (Ingestion Completed)")
 
         except Exception as rendering_err:
             QtWidgets.QMessageBox.critical(self, "GPU Mapping Error", f"Failed to instantiate render properties:\n\n{rendering_err}")
-            self.status_lbl.setText("Pipeline Error")
 
-        # Unlock application controls
-        self.load_btn.setEnabled(True)
-        self.export_btn.setEnabled(True)
-        self.progress_bar.hide()
+        self.import_action.setEnabled(True)
+        self.export_action.setEnabled(True)
+        self.loading_overlay.hide()
 
     def on_layer_changed(self, idx):
         if self._block_updates or not self.pipeline.mesh or not self.pipeline.mesh_actor: return

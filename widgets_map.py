@@ -1,5 +1,7 @@
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
+from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter
 
 class MinimapWidget(QtWidgets.QWidget):
     centerChanged = QtCore.pyqtSignal(float, float)
@@ -12,39 +14,72 @@ class MinimapWidget(QtWidgets.QWidget):
         self.dem_image = None
         self.xmin = self.xmax = self.ymin = self.ymax = 0.0
 
-    def compute_dem_from_downsampled(self, pts_downsampled):
-        if pts_downsampled is None or len(pts_downsampled) == 0: return
+    def compute_dem_from_downsampled(self, pts_downsampled, active_layer_idx=0):
+        if pts_downsampled is None or len(pts_downsampled) == 0: 
+            return
         
         self.xmin, self.xmax = pts_downsampled[:, 0].min(), pts_downsampled[:, 0].max()
         self.ymin, self.ymax = pts_downsampled[:, 1].min(), pts_downsampled[:, 1].max()
 
-        res = 128 
-        grid_z = np.zeros((res, res), dtype=np.float32)
-        grid_counts = np.zeros((res, res), dtype=np.float32)
-
-        x_idx = np.clip(((pts_downsampled[:, 0] - self.xmin) / (self.xmax - self.xmin) * (res - 1)).astype(np.int32), 0, res - 1)
-        y_idx = np.clip(((pts_downsampled[:, 1] - self.ymin) / (self.ymax - self.ymin) * (res - 1)).astype(np.int32), 0, res - 1)
-
-        for i in range(len(pts_downsampled)):
-            grid_z[y_idx[i], x_idx[i]] += pts_downsampled[i, 2]
-            grid_counts[y_idx[i], x_idx[i]] += 1.0
-
-        valid = grid_counts > 0
-        grid_z[valid] /= grid_counts[valid]
-        if not np.all(valid):
-            grid_z[~valid] = grid_z[valid].mean() if np.any(valid) else 0.0
-
-        z_min, z_max = grid_z.min(), grid_z.max()
-        if z_max != z_min:
-            norm_z = ((grid_z - z_min) / (z_max - z_min) * 255.0).astype(np.uint8)
+        # Extract coordinates and active render attribute targets
+        x = pts_downsampled[:, 0]
+        y = pts_downsampled[:, 1]
+        
+        if active_layer_idx in [0, 1, 2, 3] and pts_downsampled.shape[1] > 3:
+            scalars = pts_downsampled[:, active_layer_idx]
         else:
-            norm_z = np.zeros((res, res), dtype=np.uint8)
+            scalars = pts_downsampled[:, 2] # Fallback directly to Z elevation
 
-        self.dem_image = QtGui.QImage(res, res, QtGui.QImage.Format_Grayscale8)
-        flipped_z = np.flipud(norm_z)
-        for y in range(res):
-            for x in range(res):
-                self.dem_image.setPixel(x, y, int(flipped_z[y, x]))
+        res = 256
+        
+        # 1. Create a perfectly uniform grid matching the target image resolution
+        grid_x, grid_y = np.mgrid[
+            self.xmin:self.xmax:complex(0, res),
+            self.ymin:self.ymax:complex(0, res)
+        ]
+
+        # 2. Resample using linear interpolation instead of binning to eliminate stripe waves
+        # We take a fast subset of points if the matrix is too heavy for standard griddata
+        stride = max(1, len(pts_downsampled) // 50000)
+        points_subset = np.column_stack((x[::stride], y[::stride]))
+        scalars_subset = scalars[::stride]
+
+        grid_vals = griddata(
+            points_subset, 
+            scalars_subset, 
+            (grid_x, grid_y), 
+            method='linear'
+        )
+
+        # Fill any missing corner edge cells cleanly
+        nan_mask = np.isnan(grid_vals)
+        if np.any(nan_mask):
+            grid_vals[nan_mask] = np.nanmean(grid_vals) if not np.all(nan_mask) else 0.0
+
+        # 3. Apply a light smoothing filter to blend any remaining grain variations
+        grid_vals = gaussian_filter(grid_vals, sigma=1.2)
+
+        # 4. Map back down into standard 8-bit monochromatic intensity ranges
+        v_min, v_max = grid_vals.min(), grid_vals.max()
+        if v_max != v_min:
+            norm_bytes = ((grid_vals - v_min) / (v_max - v_min) * 255.0).astype(np.uint8)
+        else:
+            norm_bytes = np.zeros((res, res), dtype=np.uint8)
+
+        # Rotate/Transpose to correctly map spatial grid shapes right onto your landscape coordinate orientation
+        oriented_bytes = np.ascontiguousarray(np.flipud(norm_bytes.T))
+        
+        # 5. Let Qt process its internal line stride padding allocations cleanly
+        byte_data = QtCore.QByteArray(oriented_bytes.tobytes())
+        img = QtGui.QImage.fromData(byte_data)
+        
+        if img.isNull():
+            # Backup safety fallback
+            img = QtGui.QImage(oriented_bytes.data, res, res, res, QtGui.QImage.Format_Grayscale8).copy()
+        else:
+            img = img.convertToFormat(QtGui.QImage.Format_Grayscale8)
+
+        self.dem_image = img
         self.update()
 
     def get_mesh_coords(self):
@@ -54,24 +89,39 @@ class MinimapWidget(QtWidgets.QWidget):
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
+        
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+        
         painter.fillRect(self.rect(), QtGui.QColor("#1e293b"))
+        
         pad = 4
         w, h = self.width() - 2*pad, self.height() - 2*pad
-        if self.dem_image is not None:
+        if w <= 0 or h <= 0: return
+
+        if self.dem_image is not None and not self.dem_image.isNull():
             painter.drawImage(QtCore.QRect(pad, pad, w, h), self.dem_image)
             
+        painter.setPen(QtGui.QPen(QtGui.QColor("#334155"), 1))
+        painter.drawRect(pad, pad, w, h)
+            
         hx, hy = int(pad + self.cx * w), int(pad + (1.0 - self.cy) * h)
+        
         painter.setPen(QtGui.QPen(QtGui.QColor("#ef4444"), 1, QtCore.Qt.DashLine))
-        painter.drawLine(0, hy, self.width(), hy)
-        painter.drawLine(hx, 0, hx, self.height())
+        painter.drawLine(pad, hy, pad + w, hy)
+        painter.drawLine(hx, pad, hx, pad + h)
+        
+        painter.setPen(QtGui.QPen(QtGui.QColor("#f8fafc"), 1.5))
         painter.setBrush(QtGui.QColor("#ef4444"))
-        painter.drawEllipse(QtCore.QPoint(hx, hy), 4, 4)
+        painter.drawEllipse(QtCore.QPoint(hx, hy), 5, 5)
 
     def mousePressEvent(self, event):
-        if event.button() == QtCore.Qt.LeftButton: self.update_from_mouse(event.pos())
+        if event.button() == QtCore.Qt.LeftButton: 
+            self.update_from_mouse(event.pos())
 
     def mouseMoveEvent(self, event):
-        if event.buttons() & QtCore.Qt.LeftButton: self.update_from_mouse(event.pos())
+        if event.buttons() & QtCore.Qt.LeftButton: 
+            self.update_from_mouse(event.pos())
 
     def update_from_mouse(self, pos):
         pad = 4

@@ -47,10 +47,8 @@ class CartographicPipeline:
         def update_progress(val, message):
             if progress_callback:
                 progress_callback(val, message)
-            print(f"[PIPELINE] {message} ({val}%)", flush=True)
 
-        self._cached_arrays.clear()
-        update_progress(0, f"Executing deterministic mesh ingestion for: {file_path}")
+        update_progress(0, "Opening PLY asset architecture...")
 
         # -----------------------------------------------------------------
         # 1. HEADER PARSING
@@ -74,9 +72,9 @@ class CartographicPipeline:
             header_offset = len(header_bytes)
 
         if num_vertices is None or num_faces is None or header_offset is None:
-            raise ValueError("[FATAL] Malformed PLY file.")
+            raise ValueError("[FATAL] Malformed PLY file structure.")
 
-        update_progress(10, f"Header Parsed: {num_vertices:,} Vertices | {num_faces:,} Faces")
+        update_progress(5, f"Header mapped. Parsing {num_vertices:,} vertices...")
 
         # -----------------------------------------------------------------
         # 2. PARSE VERTICES
@@ -88,36 +86,54 @@ class CartographicPipeline:
         ])
         v_data = np.fromfile(file_path, dtype=vertex_dtype, count=num_vertices, offset=header_offset)
         vertices = np.column_stack((v_data['x'], v_data['y'], v_data['z']))
-        update_progress(25, "Vertex coordinate space allocated.")
+        
+        update_progress(15, f"Vertices loaded. Allocating topology memory grid...")
 
         # -----------------------------------------------------------------
-        # 3. STRIDE DATA EXTRACT 
+        # 3. CHUNKED FACE STRIDE PROCESSING (SMOOTH PROGRESS)
         # -----------------------------------------------------------------
         face_stride = 21  
         num_corners = 3   
-        
         face_start_offset = header_offset + (num_vertices * 28)
-        raw_face_bytes = np.fromfile(file_path, dtype=np.uint8, count=num_faces * face_stride, offset=face_start_offset)
-        raw_faces = raw_face_bytes.reshape((num_faces, face_stride))
+        
+        # Pre-allocate output arrays to avoid slow dynamically resizing arrays
+        face_indices = np.empty((num_faces, 3), dtype=np.int32)
+        landcover_data = np.empty(num_faces, dtype=np.int32)
+        soil_data = np.empty(num_faces, dtype=np.int32)
 
-        update_progress(40, "Extracting clean index structures and categories...")
+        # Process the 56M faces in 50 distinct structural slices
+        chunk_count = 50
+        faces_per_chunk = num_faces // chunk_count
         
-        v0 = raw_faces[:, 1:5].copy().view(np.int32).ravel()
-        v1 = raw_faces[:, 5:9].copy().view(np.int32).ravel()
-        v2 = raw_faces[:, 9:13].copy().view(np.int32).ravel()
-        
-        face_indices = np.column_stack((v0, v1, v2))
-        
-        landcover_data = raw_faces[:, 13:17].copy().view(np.int32).ravel()
-        soil_data = raw_faces[:, 17:21].copy().view(np.int32).ravel()
-
-        del raw_faces, raw_face_bytes, v0, v1, v2
-        gc.collect()
+        with open(file_path, 'rb') as f:
+            f.seek(face_start_offset)
+            
+            for i in range(chunk_count):
+                # Calculate precise dynamic boundaries
+                start_face = i * faces_per_chunk
+                end_face = num_faces if i == (chunk_count - 1) else (start_face + faces_per_chunk)
+                current_chunk_size = end_face - start_face
+                
+                # Stream binary block directly from disk
+                raw_bytes = f.read(current_chunk_size * face_stride)
+                chunk_faces = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((current_chunk_size, face_stride))
+                
+                # Unpack sub-byte arrays cleanly
+                face_indices[start_face:end_face, 0] = chunk_faces[:, 1:5].view(np.int32).ravel()
+                face_indices[start_face:end_face, 1] = chunk_faces[:, 5:9].view(np.int32).ravel()
+                face_indices[start_face:end_face, 2] = chunk_faces[:, 9:13].view(np.int32).ravel()
+                
+                landcover_data[start_face:end_face] = chunk_faces[:, 13:17].view(np.int32).ravel()
+                soil_data[start_face:end_face] = chunk_faces[:, 17:21].view(np.int32).ravel()
+                
+                # Incrementally scale progress tracker between 15% and 65%
+                current_pct = int(15 + (i / chunk_count) * 50)
+                update_progress(current_pct, f"Streaming topology block: {end_face:,} / {num_faces:,} entries")
 
         # -----------------------------------------------------------------
         # 4. CONSTRUCT VTK CELL LAYOUT
         # -----------------------------------------------------------------
-        update_progress(55, "Assembling complete topological grid matrix...")
+        update_progress(68, "Compiling flat topological grid matrix...")
         cells = np.empty((num_faces, num_corners + 1), dtype=np.int32)
         cells[:, 0] = num_corners
         cells[:, 1:] = face_indices
@@ -125,7 +141,7 @@ class CartographicPipeline:
         del face_indices
         gc.collect()
 
-        update_progress(65, "Generating solid surface geometry...")
+        update_progress(72, "Generating solid surface geometry...")
         cells_flat = cells.ravel()
         self.mesh = pv.PolyData(vertices, cells_flat)
 
@@ -141,7 +157,7 @@ class CartographicPipeline:
         del vertices
         gc.collect()
 
-        update_progress(75, "Normalizing RGBA point attributes...")
+        update_progress(80, "Normalizing RGBA point channels...")
         rgba_float = np.empty((num_vertices, 4), dtype=np.float32)
         rgba_float[:, 0] = v_data['red'] / 255.0
         rgba_float[:, 1] = v_data['green'] / 255.0
@@ -162,7 +178,7 @@ class CartographicPipeline:
         del rgba_float
         gc.collect()
 
-        update_progress(85, "Deep-copying categorical data blocks...")
+        update_progress(90, "Deep-copying categorical data blocks...")
         lc_contiguous = np.ascontiguousarray(landcover_data, dtype=np.int32)
         soil_contiguous = np.ascontiguousarray(soil_data, dtype=np.int32)
         
@@ -177,9 +193,7 @@ class CartographicPipeline:
         del landcover_data, soil_data, lc_contiguous, soil_contiguous
         gc.collect()
 
-        # NOTE: Section 6 (initialize render targets) must happen inside the main GUI 
-        # thread right after this function exits because VTK contexts cannot be manipulated on background threads.
-        update_progress(95, "Mesh parsed. Passing geometry back to GPU viewport thread...")
+        update_progress(98, "Mesh loaded completely. Finalizing engine components...")
 
     def _inject_shaders(self):
         sp = self.mesh_actor.GetShaderProperty()
