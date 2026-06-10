@@ -6,6 +6,7 @@ from pyvistaqt import QtInteractor
 from pipeline import CartographicPipeline
 from widgets_map import MinimapWidget
 from widgets_curves import DeformationControls
+from widgets_layer import GISLayerTreeWidget
 
 class ViewportProgressOverlay(QtWidgets.QWidget):
     """A classic, clean horizontal progress bar anchored to the bottom-center of the viewport."""
@@ -162,10 +163,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Layer Selection Box
         layer_group = QtWidgets.QGroupBox("Active Rendering Layer Attribute")
         layer_layout = QtWidgets.QVBoxLayout(layer_group)
-        self.layer_combo = QtWidgets.QComboBox()
-        self.layer_combo.addItems(["Hillshade", "Ambient Occlusion", "Texture Detail", "Vegetation Cover", "Landcover Class", "Soil Color Class"])
-        self.layer_combo.currentIndexChanged.connect(self.on_layer_changed)
-        layer_layout.addWidget(self.layer_combo)
+        self.layer_tree = GISLayerTreeWidget(self.pipeline, self.plotter)
+        self.layer_tree.layerChanged.connect(self.on_layer_changed)
+        layer_layout.addWidget(self.layer_tree)
         self.sidebar_layout.addWidget(layer_group)
         
         self.sidebar_layout.addStretch()
