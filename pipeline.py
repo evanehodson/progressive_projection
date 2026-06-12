@@ -229,15 +229,11 @@ class CartographicPipeline:
         update_progress(98, "Mesh loaded completely. Finalizing engine components...")
 
     def _inject_shaders(self):
-        if not self.mesh_actor:
-            self.log("WARNING: Attempted _inject_shaders on a null actor reference.")
-            return
-        
-        self.log("Injecting hardware GLSL shader code block overrides into Actor custom definitions...")
+        print("[DEBUG] [pipeline.py] Entering _inject_shaders - Setting up hardware overrides.", flush=True)
         sp = self.mesh_actor.GetShaderProperty()
         sp.ClearAllShaderReplacements()
         
-        # 1. Declare custom uniform parameters in the Vertex Shader Header
+        # 1. Inject custom uniform definitions into the vertex shader header block
         decl_code = """
             uniform vec2 u_focalCenter;
             uniform float u_maxDist;
@@ -246,32 +242,32 @@ class CartographicPipeline:
         """
         sp.AddVertexShaderReplacement("//VTK::CustomUniforms::Dec", True, decl_code, False)
 
-        # 2. Implement Progressive Warp and assign structural GLSL output variables cleanly
+        # 2. Append the progressive lift directly to vertexMC using your working logic
         impl_code = """
-            // Calculate distance utilizing native OpenGLActor model coordinates
             float d = distance(vertexMC.xy, u_focalCenter);
-            float normDist = clamp(d / u_maxDist, 0.0, 1.0);
+            float normDist = d / u_maxDist;
             float verticalLift = u_amplitude * (1.0 - exp(-u_kDecay * normDist));
-            
-            // Warp the local vertex positions prior to matrix space projection
-            vec4 warpedVertex = vec4(vertexMC.x, vertexMC.y, vertexMC.z + verticalLift, 1.0);
-            
-            // Assign mandatory VTK internal positional targets
-            vertexVCVSOutput = MCVCMatrix * warpedVertex;
-            gl_Position = MCDCMatrix * warpedVertex;
+            vertexMC.z += verticalLift;
         """
-        # Overriding the core positions implementation block completely replaces the native projection
-        sp.AddVertexShaderReplacement("//VTK::PositionVC::Impl", True, impl_code, False)
-        self.log("Shader strings injected successfully.")
+        
+        # CRITICAL: Second argument MUST be False so VTK appends code rather than destroying the pipeline
+        sp.AddVertexShaderReplacement("//VTK::PositionVC::Impl", False, impl_code, False)
+        print("[DEBUG] [pipeline.py] Shader compilation strings bound successfully.", flush=True)
 
     def update_shader_uniforms(self, cx, cy, max_dist, amplitude, k_decay):
-        if not self.mesh_actor: return
-        
+        if not self.mesh_actor: 
+            return
+            
         shader_params = self.mesh_actor.GetShaderProperty().GetVertexCustomUniforms()
-        shader_params.SetUniformf("u_amplitude", amplitude)
-        shader_params.SetUniformf("u_kDecay", k_decay)
-        shader_params.SetUniform2f("u_focalCenter", (cx, cy))
-        shader_params.SetUniformf("u_maxDist", max_dist)
+        
+        # Prevent division by zero if max_dist approaches 0
+        safe_max_dist = max(float(max_dist), 1.0)
+        
+        # Cast explicitly to native Python floats to guarantee strong C++ type matching
+        shader_params.SetUniformf("u_amplitude", float(amplitude))
+        shader_params.SetUniformf("u_kDecay", float(k_decay))
+        shader_params.SetUniform2f("u_focalCenter", (float(cx), float(cy)))
+        shader_params.SetUniformf("u_maxDist", safe_max_dist)
 
     def update_hardware_lut(self, layer_idx=None):
         if layer_idx is not None:

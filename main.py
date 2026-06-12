@@ -267,43 +267,100 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline.update_hardware_lut(idx)
         self.plotter.render()
 
-    def route_hardware_updates(self):
-        if self._block_updates or not self.pipeline.mesh or not self.pipeline.mesh_actor: return
+    def route_hardware_updates(self, *args):
+        if self._block_updates or not self.pipeline.mesh or not self.pipeline.mesh_actor: 
+            print("[DEBUG] Guard triggered: updates are blocked or mesh elements are missing.")
+            return
         
-        # 1. Fetch current user controls
-        cx, cy = self.minimap.get_mesh_coords()
-        amp = float(self.curves.amp_slider.value())
-        decay = float(self.curves.decay_slider.value() / 10.0)
-        
-        # Pull slider value safely to scale camera elevation proportionally
-        alt_factor = float(self.curves.alt_slider.value() / 100.0)
-        if alt_factor <= 0: alt_factor = 0.1
+        print("\n=== [MINIMAP INTERACTION TRACE] ===")
+        try:
+            # 1. Fetch current user controls
+            cx, cy = self.minimap.get_mesh_coords()
+            amp = float(self.curves.amp_slider.value())
+            decay = float(self.curves.decay_slider.value() / 10.0)
+            
+            alt_factor = float(self.curves.alt_slider.value() / 100.0)
+            if alt_factor <= 0: alt_factor = 0.1
 
-        # 2. Extract bounding radius constraints
-        xmin, xmax, ymin, ymax, zmin, zmax = self.pipeline.mesh.bounds
-        corners = np.array([[xmin, ymin], [xmin, ymax], [xmax, ymin], [xmax, ymax]])
-        max_dist = float(np.max(np.sqrt((corners[:, 0] - cx)**2 + (corners[:, 1] - cy)**2)))
-        if max_dist <= 0: max_dist = 1.0
+            print(f" -> Normalized inputs clicked: cx={self.minimap.cx:.4f}, cy={self.minimap.cy:.4f}")
+            print(f" -> Extrapolated mesh target:  X={cx:.2f}, Y={cy:.2f}")
 
-        # 3. Stream uniform parameters straight to the hardware actor shader uniforms
-        self.pipeline.update_shader_uniforms(cx, cy, max_dist, amp, decay)
+            # 2. Extract bounding radius constraints
+            xmin, xmax, ymin, ymax, zmin, zmax = self.pipeline.mesh.bounds
+            print(f" -> Real VTK Mesh Bounds:      X:[{xmin:.1f} to {xmax:.1f}], Y:[{ymin:.1f} to {ymax:.1f}], Z:[{zmin:.1f} to {zmax:.1f}]")
 
-        # 4. Handle proportional view matrix tracking
-        pts = self.pipeline.lightweight_points
-        center_idx = np.argmin((pts[:, 0] - cx)**2 + (pts[:, 1] - cy)**2)
-        z_base = pts[center_idx, 2]
-        
-        # Derive structural distance sizing from bounding plane diagonal layout
-        diagonal = np.sqrt((xmax - xmin)**2 + (ymax - ymin)**2)
-        camera_distance = diagonal * alt_factor
+            # Check if coordinates mapped outside real spatial limits
+            if not (xmin <= cx <= xmax) or not (ymin <= cy <= ymax):
+                print(" [⚠️ WARNING] Target coordinate is completely OUTSIDE actual mesh boundaries!")
 
-        # Secure a stable bird's-eye projection centered cleanly above the target pin anchor
-        self.plotter.camera.position = (cx, cy - (camera_distance * 0.4), z_base + camera_distance)
-        self.plotter.camera.focal_point = (cx, cy, z_base)
-        self.plotter.camera.up = (0.0, 0.0, 1.0) # Maintain Z-axis upward orientation alignment
-        
-        # 5. Redraw viewport canvas
-        self.plotter.render()
+            corners = np.array([[xmin, ymin], [xmin, ymax], [xmax, ymin], [xmax, ymax]])
+            max_dist = float(np.max(np.sqrt((corners[:, 0] - cx)**2 + (corners[:, 1] - cy)**2)))
+            if max_dist <= 0: max_dist = 1.0
+
+            # 3. Stream uniform parameters straight to the hardware actor shader uniforms
+            print(f" -> Sending Shader Uniforms: Center=({cx:.2f}, {cy:.2f}), MaxDist={max_dist:.2f}, Amp={amp:.2f}, Decay={decay:.2f}")
+            self.pipeline.update_shader_uniforms(cx, cy, max_dist, amp, decay)
+
+            # 4. Handle proportional view matrix tracking
+            pts = self.pipeline.lightweight_points
+            if pts is None or len(pts) == 0:
+                print(" [⚠️ WARNING] pipeline.lightweight_points is empty! Falling back to flat bounding center.")
+                z_base = (zmin + zmax) / 2.0
+            else:
+                center_idx = np.argmin((pts[:, 0] - cx)**2 + (pts[:, 1] - cy)**2)
+                z_base = pts[center_idx, 2]
+                print(f" -> Nearest node tracking:      Index={center_idx}, base Z elevation={z_base:.2f}")
+            
+            diagonal = np.sqrt((xmax - xmin)**2 + (ymax - ymin)**2)
+            camera_distance = diagonal * alt_factor
+
+            pos_x = cx
+            pos_y = cy - (camera_distance * 0.4)
+            pos_z = z_base + camera_distance
+
+            print(f" -> Calculated Distance Scaling: Diagonal={diagonal:.2f}, CamDistance={camera_distance:.2f}")
+            print(f" -> Target Camera Position:      ({pos_x:.2f}, {pos_y:.2f}, {pos_z:.2f})")
+            print(f" -> Target Camera Focal Point:   ({cx:.2f}, {cy:.2f}, {z_base:.2f})")
+
+            # Check for non-finite values that shatter the projection matrix
+            if not np.all(np.isfinite([pos_x, pos_y, pos_z, cx, cy, z_base])):
+                print(" [❌ ERROR] Non-finite float value (NaN or Inf) detected in camera layout coordinates!")
+
+            self.plotter.camera.position = (pos_x, pos_y, pos_z)
+            self.plotter.camera.focal_point = (cx, cy, z_base)
+            self.plotter.camera.up = (0.0, 0.0, 1.0)
+            
+            # Keep manual expansive depth limits for custom vertex shader displacements
+            self.plotter.camera.clipping_range = (0.1, 1000.0)
+            self.plotter.camera.Modified()
+            
+            # === DEEP STATE VERIFICATION DEBUG LOGS ===
+            print(f" [PIPELINE TRACE] Actor Visibility: {self.pipeline.mesh_actor.GetVisibility()}")
+            print(f" [PIPELINE TRACE] Actor Mapper Address: {self.pipeline.mesh_actor.GetMapper()}")
+            print(f" [PIPELINE TRACE] Camera Manual Clipping Range: {self.plotter.camera.clipping_range}")
+            print(f" [PIPELINE TRACE] Camera View Angle: {self.plotter.camera.view_angle}")
+            
+            # FIX: Bypass PyVista wrapper object and extract 4x4 matrix elements safely 
+            # straight from the C++ underlying vtkCamera pointer.
+            vtk_cam = self.plotter.camera
+            m = vtk_cam.GetModelViewTransformMatrix()
+            print(" [PIPELINE TRACE] Native View Matrix Structural Orientation Layout:")
+            print(f"    [{m.GetElement(0,0):.4f}, {m.GetElement(0,1):.4f}, {m.GetElement(0,2):.4f}, {m.GetElement(0,3):.4f}]")
+            print(f"    [{m.GetElement(1,0):.4f}, {m.GetElement(1,1):.4f}, {m.GetElement(1,2):.4f}, {m.GetElement(1,3):.4f}]")
+            print(f"    [{m.GetElement(2,0):.4f}, {m.GetElement(2,1):.4f}, {m.GetElement(2,2):.4f}, {m.GetElement(2,3):.4f}]")
+            print(f"    [{m.GetElement(3,0):.4f}, {m.GetElement(3,1):.4f}, {m.GetElement(3,2):.4f}, {m.GetElement(3,3):.4f}]")
+            # ==========================================
+
+            # 5. Redraw viewport canvas
+            self.plotter.render()
+            print(" -> Status: Render pipeline execution passed successfully.")
+
+        except Exception as e:
+            import traceback
+            print(" [❌ CRITICAL EXCEPTION ENCOUNTERED]")
+            traceback.print_exc()
+            
+        print("====================================\n")
 
     def on_export_masks(self):
         self.pipeline.execute_multipass_export(self.plotter, base_filename="berann_export")

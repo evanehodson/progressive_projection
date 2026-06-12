@@ -39,7 +39,6 @@ class MinimapWidget(QtWidgets.QWidget):
         ]
 
         # 2. Resample using linear interpolation instead of binning to eliminate stripe waves
-        # We take a fast subset of points if the matrix is too heavy for standard griddata
         stride = max(1, len(pts_downsampled) // 50000)
         points_subset = np.column_stack((x[::stride], y[::stride]))
         scalars_subset = scalars[::stride]
@@ -74,7 +73,6 @@ class MinimapWidget(QtWidgets.QWidget):
         img = QtGui.QImage.fromData(byte_data)
         
         if img.isNull():
-            # Backup safety fallback
             img = QtGui.QImage(oriented_bytes.data, res, res, res, QtGui.QImage.Format_Grayscale8).copy()
         else:
             img = img.convertToFormat(QtGui.QImage.Format_Grayscale8)
@@ -87,29 +85,51 @@ class MinimapWidget(QtWidgets.QWidget):
         my = self.ymin + self.cy * (self.ymax - self.ymin)
         return mx, my
 
+    def _get_aspect_corrected_rect(self):
+        """Helper to compute map geometry framing inside available widget viewport space."""
+        pad = 4
+        w, h = self.width() - 2*pad, self.height() - 2*pad
+        if w <= 0 or h <= 0:
+            return 0, 0, 0, 0, 0, 0
+
+        spatial_w = self.xmax - self.xmin
+        spatial_h = self.ymax - self.ymin
+        aspect_ratio = spatial_h / spatial_w if spatial_w > 0 else 1.0
+
+        if w * aspect_ratio <= h:
+            view_w = w
+            view_h = int(w * aspect_ratio)
+        else:
+            view_h = h
+            view_w = int(h / aspect_ratio)
+
+        ox = pad + (w - view_w) // 2
+        oy = pad + (h - view_h) // 2
+        return ox, oy, view_w, view_h
+
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
-        
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
         
         painter.fillRect(self.rect(), QtGui.QColor("#1e293b"))
         
-        pad = 4
-        w, h = self.width() - 2*pad, self.height() - 2*pad
-        if w <= 0 or h <= 0: return
+        ox, oy, view_w, view_h = self._get_aspect_corrected_rect()
+        if view_w <= 0 or view_h <= 0: return
 
+        # Draw image within un-distorted boundaries
         if self.dem_image is not None and not self.dem_image.isNull():
-            painter.drawImage(QtCore.QRect(pad, pad, w, h), self.dem_image)
+            painter.drawImage(QtCore.QRect(ox, oy, view_w, view_h), self.dem_image)
             
         painter.setPen(QtGui.QPen(QtGui.QColor("#334155"), 1))
-        painter.drawRect(pad, pad, w, h)
+        painter.drawRect(ox, oy, view_w, view_h)
             
-        hx, hy = int(pad + self.cx * w), int(pad + (1.0 - self.cy) * h)
+        hx = int(ox + self.cx * view_w)
+        hy = int(oy + (1.0 - self.cy) * view_h)
         
         painter.setPen(QtGui.QPen(QtGui.QColor("#ef4444"), 1, QtCore.Qt.DashLine))
-        painter.drawLine(pad, hy, pad + w, hy)
-        painter.drawLine(hx, pad, hx, pad + h)
+        painter.drawLine(ox, hy, ox + view_w, hy)
+        painter.drawLine(hx, oy, hx, oy + view_h)
         
         painter.setPen(QtGui.QPen(QtGui.QColor("#f8fafc"), 1.5))
         painter.setBrush(QtGui.QColor("#ef4444"))
@@ -124,10 +144,11 @@ class MinimapWidget(QtWidgets.QWidget):
             self.update_from_mouse(event.pos())
 
     def update_from_mouse(self, pos):
-        pad = 4
-        w, h = self.width() - 2*pad, self.height() - 2*pad
-        if w <= 0 or h <= 0: return
-        self.cx = np.clip((pos.x() - pad) / w, 0.0, 1.0)
-        self.cy = np.clip(1.0 - ((pos.y() - pad) / h), 0.0, 1.0)
+        ox, oy, view_w, view_h = self._get_aspect_corrected_rect()
+        if view_w <= 0 or view_h <= 0: return
+        
+        # Evaluate crosshair alignment relative to corrected sub-grid space
+        self.cx = np.clip((pos.x() - ox) / view_w, 0.0, 1.0)
+        self.cy = np.clip(1.0 - ((pos.y() - oy) / view_h), 0.0, 1.0)
         self.update()
         self.centerChanged.emit(self.cx, self.cy)
