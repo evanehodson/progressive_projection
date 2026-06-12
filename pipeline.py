@@ -15,19 +15,10 @@ class CartographicPipeline:
         self._cached_arrays = {}
         self.active_layer_idx = 0
         
-        # 1. Build standard high-fidelity USGS NLCD color definitions
         self.nlcd_lut = self._build_nlcd_lookup_table()
-        
-        # 2. Build Soil Palette dynamically from your project folder CSV schema
         self.soil_lut = self._build_soil_lookup_table("soil_color_lookup_extended_na.csv")
 
-    def log(self, message):
-        # Explicit un-silenced standard out streaming for real-time console tracing
-        print(f"[PIPELINE DIAGNOSTIC] {message}")
-        sys.stdout.flush()
-
     def _build_nlcd_lookup_table(self):
-        """Constructs an official multi-colored USGS NLCD lookup index."""
         lut = vtk.vtkLookupTable()
         lut.SetNumberOfTableValues(256) 
         lut.Build()
@@ -94,7 +85,6 @@ class CartographicPipeline:
         def update_progress(val, message):
             if progress_callback: progress_callback(val, message)
 
-        self.log(f"Starting execution loop for file: {file_path}")
         update_progress(0, "Opening PLY asset architecture...")
 
         num_vertices = None
@@ -117,7 +107,6 @@ class CartographicPipeline:
         if num_vertices is None or num_faces is None or header_offset is None:
             raise ValueError("[FATAL] Malformed PLY file structure.")
 
-        self.log(f"Parsed Header Header Offset={header_offset} bytes | Vertices={num_vertices:,} | Faces={num_faces:,}")
         update_progress(5, f"Header mapped. Parsing {num_vertices:,} vertices...")
 
         vertex_dtype = np.dtype([
@@ -128,7 +117,6 @@ class CartographicPipeline:
         v_data = np.fromfile(file_path, dtype=vertex_dtype, count=num_vertices, offset=header_offset)
         vertices = np.column_stack((v_data['x'], v_data['y'], v_data['z']))
         
-        self.log(f"Vertices read into NumPy. Memory Shape={vertices.shape}")
         update_progress(15, f"Vertices loaded. Allocating topology memory grid...")
 
         face_stride = 21  
@@ -162,7 +150,6 @@ class CartographicPipeline:
                 current_pct = int(15 + (i / chunk_count) * 50)
                 update_progress(current_pct, f"Streaming topology block: {end_face:,} / {num_faces:,} entries")
 
-        self.log("Face byte stride extraction successful.")
         update_progress(68, "Compiling flat topological grid matrix...")
         cells = np.empty((num_faces, num_corners + 1), dtype=np.int32)
         cells[:, 0] = num_corners
@@ -174,16 +161,13 @@ class CartographicPipeline:
         update_progress(72, "Generating solid surface geometry...")
         cells_flat = cells.ravel()
         
-        self.log("Assembling pyvista.PolyData allocation...")
         self.mesh = pv.PolyData(vertices, cells_flat)
-        self.log(f"PolyData Mesh Created Successfully. Bounds={self.mesh.bounds}")
 
         del cells, cells_flat
         gc.collect()
 
         step = max(1, num_vertices // 40000)
         self.lightweight_points = vertices[::step, :].copy()
-        self.log(f"Generated lightweight downsampled tracking points. Shape={self.lightweight_points.shape}")
 
         del vertices
         gc.collect()
@@ -204,7 +188,6 @@ class CartographicPipeline:
             vtk_arr = numpy_to_vtk(channel, deep=True, array_type=vtk.VTK_FLOAT)
             vtk_arr.SetName(name)
             self.mesh.GetPointData().AddArray(vtk_arr)
-            self.log(f"Attached Point Scalar Array: '{name}'")
             del channel
 
         del rgba_float
@@ -222,18 +205,15 @@ class CartographicPipeline:
         soil_arr.SetName("soil_color")
         self.mesh.GetCellData().AddArray(soil_arr)
 
-        self.log("Categorical cell textures successfully bound to spatial context.")
         del landcover_data, soil_data, lc_contiguous, soil_contiguous
         gc.collect()
 
         update_progress(98, "Mesh loaded completely. Finalizing engine components...")
 
     def _inject_shaders(self):
-        print("[DEBUG] [pipeline.py] Entering _inject_shaders - Setting up hardware overrides.", flush=True)
         sp = self.mesh_actor.GetShaderProperty()
         sp.ClearAllShaderReplacements()
         
-        # 1. Inject custom uniform definitions into the vertex shader header block
         decl_code = """
             uniform vec2 u_focalCenter;
             uniform float u_maxDist;
@@ -242,28 +222,23 @@ class CartographicPipeline:
         """
         sp.AddVertexShaderReplacement("//VTK::CustomUniforms::Dec", True, decl_code, False)
 
-        # 2. Append the progressive lift directly to vertexMC using your working logic
         impl_code = """
             float d = distance(vertexMC.xy, u_focalCenter);
-            float normDist = d / u_maxDist;
+            float normDist = clamp(d / u_maxDist, 0.0, 1.0);
             float verticalLift = u_amplitude * (1.0 - exp(-u_kDecay * normDist));
-            vertexMC.z += verticalLift;
+            vec4 warpedVertex = vec4(vertexMC.x, vertexMC.y, vertexMC.z + verticalLift, 1.0);
+            vertexVCVSOutput = MCVCMatrix * warpedVertex;
+            gl_Position = MCDCMatrix * warpedVertex;
         """
-        
-        # CRITICAL: Second argument MUST be False so VTK appends code rather than destroying the pipeline
-        sp.AddVertexShaderReplacement("//VTK::PositionVC::Impl", False, impl_code, False)
-        print("[DEBUG] [pipeline.py] Shader compilation strings bound successfully.", flush=True)
+        sp.AddVertexShaderReplacement("//VTK::PositionVC::Impl", True, impl_code, False)
 
     def update_shader_uniforms(self, cx, cy, max_dist, amplitude, k_decay):
         if not self.mesh_actor: 
             return
             
         shader_params = self.mesh_actor.GetShaderProperty().GetVertexCustomUniforms()
-        
-        # Prevent division by zero if max_dist approaches 0
         safe_max_dist = max(float(max_dist), 1.0)
         
-        # Cast explicitly to native Python floats to guarantee strong C++ type matching
         shader_params.SetUniformf("u_amplitude", float(amplitude))
         shader_params.SetUniformf("u_kDecay", float(k_decay))
         shader_params.SetUniform2f("u_focalCenter", (float(cx), float(cy)))
@@ -278,8 +253,6 @@ class CartographicPipeline:
         mapper = self.mesh_actor.GetMapper()
         layer_map = {0: "Hillshade", 1: "AO", 2: "Texture", 3: "Vegetation", 4: "landcover", 5: "soil_color"}
         target_array = layer_map.get(self.active_layer_idx, "Hillshade")
-
-        self.log(f"Shifting hardware color mapping strategy to: {target_array} (Layer index={self.active_layer_idx})")
 
         if self.active_layer_idx in [0, 1, 2, 3]:
             mapper.SetScalarModeToUsePointFieldData()
@@ -317,7 +290,6 @@ class CartographicPipeline:
 
         mapper.Update()
         self.mesh_actor.Modified()
-        self.log("Hardware lookup update cycle completed.")
 
     def execute_multipass_export(self, plotter, base_filename="export"):
         if not self.mesh_actor: return
