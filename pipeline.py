@@ -79,6 +79,7 @@ class CartographicPipeline:
         for code, rgb in mapping.items():
             if 0 <= code <= max_real_code:
                 lut.SetTableValue(code, rgb[0]/255.0, rgb[1]/255.0, rgb[2]/255.0, 1.0)
+        lut.SetTableRange(0, max_real_code)
         return lut
 
     def load_mesh(self, file_path, plotter, progress_callback=None):
@@ -213,7 +214,7 @@ class CartographicPipeline:
     def _inject_shaders(self):
         sp = self.mesh_actor.GetShaderProperty()
         sp.ClearAllShaderReplacements()
-        
+
         decl_code = """
             uniform vec2 u_focalCenter;
             uniform float u_maxDist;
@@ -222,20 +223,18 @@ class CartographicPipeline:
         """
         sp.AddVertexShaderReplacement("//VTK::CustomUniforms::Dec", True, decl_code, False)
 
-        impl_code = """
-            float d = distance(vertexMC.xy, u_focalCenter);
-            float normDist = clamp(d / u_maxDist, 0.0, 1.0);
-            float verticalLift = u_amplitude * (1.0 - exp(-u_kDecay * normDist));
-            vec4 warpedVertex = vec4(vertexMC.x, vertexMC.y, vertexMC.z + verticalLift, 1.0);
-            vertexVCVSOutput = MCVCMatrix * warpedVertex;
-            gl_Position = MCDCMatrix * warpedVertex;
+        begin_code = """
+            float _pp_d = distance(vertexMC.xy, u_focalCenter);
+            float _pp_normDist = clamp(_pp_d / u_maxDist, 0.0, 1.0);
+            float _pp_verticalLift = u_amplitude * (1.0 - exp(-u_kDecay * _pp_normDist));
+            vec4 vertexMC = vec4(vertexMC.x, vertexMC.y, vertexMC.z + _pp_verticalLift, 1.0);
         """
-        sp.AddVertexShaderReplacement("//VTK::PositionVC::Impl", True, impl_code, False)
+        sp.AddVertexShaderReplacement("//VTK::CustomBegin::Impl", True, begin_code, False)
 
     def update_shader_uniforms(self, cx, cy, max_dist, amplitude, k_decay):
         if not self.mesh_actor: 
             return
-            
+
         shader_params = self.mesh_actor.GetShaderProperty().GetVertexCustomUniforms()
         safe_max_dist = max(float(max_dist), 1.0)
         
