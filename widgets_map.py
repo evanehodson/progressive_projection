@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 from scipy.interpolate import griddata
@@ -13,6 +14,7 @@ class MinimapWidget(QtWidgets.QWidget):
         self.cx, self.cy = 0.5, 0.5  
         self.dem_image = None
         self.xmin = self.xmax = self.ymin = self.ymax = 0.0
+        self.view_angle = 0.0
 
     def compute_dem_from_downsampled(self, pts_downsampled, active_layer_idx=0):
         if pts_downsampled is None or len(pts_downsampled) == 0: 
@@ -80,6 +82,10 @@ class MinimapWidget(QtWidgets.QWidget):
         self.dem_image = img
         self.update()
 
+    def set_view_angle(self, degrees):
+        self.view_angle = degrees
+        self.update()
+
     def get_mesh_coords(self):
         mx = self.xmin + self.cx * (self.xmax - self.xmin)
         my = self.ymin + self.cy * (self.ymax - self.ymin)
@@ -134,6 +140,21 @@ class MinimapWidget(QtWidgets.QWidget):
         painter.setPen(QtGui.QPen(QtGui.QColor("#f8fafc"), 1.5))
         painter.setBrush(QtGui.QColor("#ef4444"))
         painter.drawEllipse(QtCore.QPoint(hx, hy), 5, 5)
+
+        arrow_rad = math.radians(self.view_angle)
+        arrow_len = min(view_w, view_h) * 0.35
+        end_x = int(hx + arrow_len * math.sin(arrow_rad))
+        end_y = int(hy - arrow_len * math.cos(arrow_rad))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#60a5fa"), 2))
+        painter.drawLine(hx, hy, end_x, end_y)
+        head_size = min(view_w, view_h) * 0.06
+        head_angle = math.atan2(hy - end_y, hx - end_x)
+        ax1 = int(end_x + head_size * math.cos(head_angle + 0.5))
+        ay1 = int(end_y + head_size * math.sin(head_angle + 0.5))
+        ax2 = int(end_x + head_size * math.cos(head_angle - 0.5))
+        ay2 = int(end_y + head_size * math.sin(head_angle - 0.5))
+        painter.setBrush(QtGui.QColor("#60a5fa"))
+        painter.drawPolygon(QtCore.QPoint(end_x, end_y), QtCore.QPoint(ax1, ay1), QtCore.QPoint(ax2, ay2))
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton: 

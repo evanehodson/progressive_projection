@@ -1,4 +1,5 @@
 import sys
+import math
 import numpy as np
 from PyQt5 import QtWidgets, QtCore
 from pyvistaqt import QtInteractor
@@ -150,10 +151,11 @@ class MainWindow(QtWidgets.QMainWindow):
         map_layout.addWidget(self.minimap)
         self.sidebar_layout.addWidget(map_group)
 
-        warp_group = QtWidgets.QGroupBox("Funnel Geometry Deformation Curve")
+        warp_group = QtWidgets.QGroupBox("Deformation & View Controls")
         warp_layout = QtWidgets.QVBoxLayout(warp_group)
         self.curves = DeformationControls()
         self.curves.warpProfileChanged.connect(self._on_warp_profile)
+        self.curves.viewAngleChanged.connect(self.route_hardware_updates)
         warp_layout.addWidget(self.curves)
         self.sidebar_layout.addWidget(warp_group)
         
@@ -234,8 +236,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Pre-seed warp buffers for both proxy and full mesh
             seed_profile = np.zeros(256, dtype=np.float32)
-            self.pipeline._warp_proxy_cpu(0.0, 0.0, 1.0, seed_profile)
-            self.pipeline._warp_mesh_cpu(0.0, 0.0, 1.0, seed_profile)
+            self.pipeline._warp_proxy_cpu(0.0, 0.0, 0.0, seed_profile)
+            self.pipeline._warp_mesh_cpu(0.0, 0.0, 0.0, seed_profile)
 
             self.plotter.reset_camera()
             
@@ -266,6 +268,7 @@ class MainWindow(QtWidgets.QMainWindow):
         import sys, traceback
         try:
             cx, cy = self.minimap.get_mesh_coords()
+            view_angle = float(self.curves.view_angle_slider.value())
             profile = self._current_warp_profile
             if profile is None:
                 return
@@ -275,11 +278,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             xmin, xmax, ymin, ymax, zmin, zmax = self.pipeline.mesh.bounds
 
-            corners = np.array([[xmin, ymin], [xmin, ymax], [xmax, ymin], [xmax, ymax]])
-            max_dist = float(np.max(np.sqrt((corners[:, 0] - cx)**2 + (corners[:, 1] - cy)**2)))
-            if max_dist <= 0: max_dist = 1.0
-
-            self.pipeline._warp_proxy_cpu(cx, cy, max_dist, profile)
+            self.pipeline._warp_proxy_cpu(cx, cy, view_angle, profile)
             if not self.pipeline._using_proxy:
                 self.pipeline.swap_to_proxy()
 
@@ -295,14 +294,17 @@ class MainWindow(QtWidgets.QMainWindow):
             diagonal = np.sqrt((xmax - xmin)**2 + (ymax - ymin)**2)
             camera_distance = diagonal * alt_factor
 
-            pos_x = cx
-            pos_y = cy - (camera_distance * 0.4)
+            theta_rad = math.radians(view_angle)
+            pos_x = cx - (camera_distance * 0.4) * math.sin(theta_rad)
+            pos_y = cy - (camera_distance * 0.4) * math.cos(theta_rad)
             pos_z = z_base + camera_distance
 
             self.plotter.camera.position = (pos_x, pos_y, pos_z)
             self.plotter.camera.focal_point = (cx, cy, z_base)
             self.plotter.camera.up = (0.0, 0.0, 1.0)
             self.plotter.camera.clipping_range = (0.1, 100000.0)
+
+            self.minimap.set_view_angle(view_angle)
 
             self.pipeline.mesh_actor.Modified()
 
@@ -322,15 +324,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             cx, cy = self.minimap.get_mesh_coords()
+            view_angle = float(self.curves.view_angle_slider.value())
             profile = self._current_warp_profile
             if profile is None:
                 return
-            xmin, xmax, ymin, ymax = self.pipeline.mesh.bounds[:4]
-            corners = np.array([[xmin, ymin], [xmin, ymax], [xmax, ymin], [xmax, ymax]])
-            max_dist = float(np.max(np.sqrt((corners[:, 0] - cx)**2 + (corners[:, 1] - cy)**2)))
-            if max_dist <= 0: max_dist = 1.0
 
-            self.pipeline._warp_mesh_cpu(cx, cy, max_dist, profile)
+            self.pipeline._warp_mesh_cpu(cx, cy, view_angle, profile)
             self.pipeline.swap_to_full()
             self.plotter.render()
 

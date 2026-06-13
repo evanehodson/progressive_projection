@@ -143,10 +143,10 @@ class WarpCurveEditor(QtWidgets.QWidget):
                      f"{self._max_y / 2:.0f}")
         qp.drawText(0, self._pad_top + h - 12, self._pad_left - 4, 14,
                      QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom, "0")
-        qp.drawText(self._pad_left, self._pad_top + h + 4, 40, 14,
-                     QtCore.Qt.AlignLeft, "Center")
-        qp.drawText(self._pad_left + w - 36, self._pad_top + h + 4, 36, 14,
-                     QtCore.Qt.AlignRight, "Edge")
+        qp.drawText(self._pad_left, self._pad_top + h + 4, 50, 14,
+                     QtCore.Qt.AlignLeft, "Horizon")
+        qp.drawText(self._pad_left + w - 65, self._pad_top + h + 4, 65, 14,
+                     QtCore.Qt.AlignRight, "Foreground")
 
         # Curve
         ys = self._sample_curve()
@@ -264,6 +264,7 @@ class WarpCurveEditor(QtWidgets.QWidget):
 
 class DeformationControls(QtWidgets.QWidget):
     warpProfileChanged = QtCore.pyqtSignal(object)
+    viewAngleChanged = QtCore.pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -274,10 +275,29 @@ class DeformationControls(QtWidgets.QWidget):
         self.curve_editor.curveChanged.connect(self.warpProfileChanged.emit)
         layout.addWidget(self.curve_editor)
 
+        layout.addWidget(QtWidgets.QLabel("View Direction (Azimuth):"))
+        self.view_angle_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.view_angle_slider.setRange(0, 359)
+        self.view_angle_slider.setValue(0)
+        self.view_angle_slider.valueChanged.connect(self._on_view_angle_changed)
+        layout.addWidget(self.view_angle_slider)
+
+        self.view_angle_label = QtWidgets.QLabel("0\u00b0 (North)")
+        layout.addWidget(self.view_angle_label)
+
         layout.addWidget(QtWidgets.QLabel("Camera Altitude Height:"))
         self.alt_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.alt_slider.setRange(1, 2000)
         layout.addWidget(self.alt_slider)
+
+    def _on_view_angle_changed(self, val):
+        labels = {0: "North", 90: "East", 180: "South", 270: "West"}
+        label = labels.get(val, "")
+        if label:
+            self.view_angle_label.setText(f"{val}\u00b0 ({label})")
+        else:
+            self.view_angle_label.setText(f"{val}\u00b0")
+        self.viewAngleChanged.emit(float(val))
 
     def calibrate_ranges(self, diagonal):
         self.alt_slider.setRange(1, int(diagonal * 0.8))

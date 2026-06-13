@@ -249,8 +249,7 @@ class CartographicPipeline:
         self._proxy_mesh = pv.wrap(proxy_pd)
         self._proxy_original_z = self._proxy_mesh.points[:, 2].copy()
 
-    def _warp_mesh_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, profile=None):
-        """Warp mesh vertices on CPU using a sampled profile curve."""
+    def _warp_mesh_cpu(self, cx=0.0, cy=0.0, view_angle=0.0, profile=None):
         if self._original_mesh_z is None:
             return
         if profile is None or len(profile) < 2:
@@ -266,17 +265,29 @@ class CartographicPipeline:
             self._buf_depression = np.empty(self._cached_n, dtype=np.float32)
 
         cx_f = np.float32(cx); cy_f = np.float32(cy)
-        md_f = np.float32(max(max_dist, 1.0))
-        inv_md = np.float32(1.0) / md_f
+        angle_rad = np.float32(np.radians(view_angle))
+        sin_a = np.float32(np.sin(angle_rad))
+        cos_a = np.float32(np.cos(angle_rad))
 
         np.subtract(self._buf_x, cx_f, out=self._buf_d)
-        np.multiply(self._buf_d, self._buf_d, out=self._buf_d)
+        np.multiply(self._buf_d, sin_a, out=self._buf_d)
         np.subtract(self._buf_y, cy_f, out=self._buf_temp)
-        np.multiply(self._buf_temp, self._buf_temp, out=self._buf_temp)
+        np.multiply(self._buf_temp, cos_a, out=self._buf_temp)
         np.add(self._buf_d, self._buf_temp, out=self._buf_d)
-        np.sqrt(self._buf_d, out=self._buf_d)
 
-        np.multiply(self._buf_d, inv_md, out=self._buf_d)
+        xmin, xmax, ymin, ymax, _, _ = self.mesh.bounds
+        corners_x = np.array([xmin, xmin, xmax, xmax], dtype=np.float32)
+        corners_y = np.array([ymin, ymax, ymin, ymax], dtype=np.float32)
+        v_corners = (corners_x - cx_f) * sin_a + (corners_y - cy_f) * cos_a
+        v_min = v_corners.min()
+        v_max = v_corners.max()
+        depth_range = v_max - v_min
+        if depth_range <= np.float32(0.0):
+            depth_range = np.float32(1.0)
+        inv_range = np.float32(1.0) / depth_range
+
+        np.subtract(v_max, self._buf_d, out=self._buf_d)
+        np.multiply(self._buf_d, inv_range, out=self._buf_d)
         np.clip(self._buf_d, np.float32(0.0), np.float32(1.0), out=self._buf_d)
 
         lookup_x = np.linspace(0.0, 1.0, len(profile), dtype=np.float32)
@@ -285,8 +296,7 @@ class CartographicPipeline:
         np.add(self._original_mesh_z, self._buf_depression, out=self._cached_np_data[:, 2])
         self.mesh.GetPoints().GetData().Modified()
 
-    def _warp_proxy_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, profile=None):
-        """Warp the proxy mesh with sampled profile, fast path for interactive use."""
+    def _warp_proxy_cpu(self, cx=0.0, cy=0.0, view_angle=0.0, profile=None):
         if self._proxy_original_z is None or self._proxy_mesh is None:
             return
         if profile is None or len(profile) < 2:
@@ -302,17 +312,29 @@ class CartographicPipeline:
             self._proxy_buf_depression = np.empty(self._proxy_cached_n, dtype=np.float32)
 
         cx_f = np.float32(cx); cy_f = np.float32(cy)
-        md_f = np.float32(max(max_dist, 1.0))
-        inv_md = np.float32(1.0) / md_f
+        angle_rad = np.float32(np.radians(view_angle))
+        sin_a = np.float32(np.sin(angle_rad))
+        cos_a = np.float32(np.cos(angle_rad))
 
         np.subtract(self._proxy_buf_x, cx_f, out=self._proxy_buf_d)
-        np.multiply(self._proxy_buf_d, self._proxy_buf_d, out=self._proxy_buf_d)
+        np.multiply(self._proxy_buf_d, sin_a, out=self._proxy_buf_d)
         np.subtract(self._proxy_buf_y, cy_f, out=self._proxy_buf_temp)
-        np.multiply(self._proxy_buf_temp, self._proxy_buf_temp, out=self._proxy_buf_temp)
+        np.multiply(self._proxy_buf_temp, cos_a, out=self._proxy_buf_temp)
         np.add(self._proxy_buf_d, self._proxy_buf_temp, out=self._proxy_buf_d)
-        np.sqrt(self._proxy_buf_d, out=self._proxy_buf_d)
 
-        np.multiply(self._proxy_buf_d, inv_md, out=self._proxy_buf_d)
+        xmin, xmax, ymin, ymax, _, _ = self._proxy_mesh.bounds
+        corners_x = np.array([xmin, xmin, xmax, xmax], dtype=np.float32)
+        corners_y = np.array([ymin, ymax, ymin, ymax], dtype=np.float32)
+        v_corners = (corners_x - cx_f) * sin_a + (corners_y - cy_f) * cos_a
+        v_min = v_corners.min()
+        v_max = v_corners.max()
+        depth_range = v_max - v_min
+        if depth_range <= np.float32(0.0):
+            depth_range = np.float32(1.0)
+        inv_range = np.float32(1.0) / depth_range
+
+        np.subtract(v_max, self._proxy_buf_d, out=self._proxy_buf_d)
+        np.multiply(self._proxy_buf_d, inv_range, out=self._proxy_buf_d)
         np.clip(self._proxy_buf_d, np.float32(0.0), np.float32(1.0), out=self._proxy_buf_d)
 
         lookup_x = np.linspace(0.0, 1.0, len(profile), dtype=np.float32)
