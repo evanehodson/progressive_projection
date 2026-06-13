@@ -12,8 +12,13 @@ class CartographicPipeline:
         self.mesh = None
         self.mesh_actor = None
         self.lightweight_points = None
-        self._original_mesh_z = None  # store original Z for CPU warping
-        self._cached_np_data = None   # cached numpy view of VTK points
+        self._original_mesh_z = None
+        self._cached_np_data = None
+        self._buf_x = None
+        self._buf_y = None
+        self._buf_d = None
+        self._buf_temp = None
+        self._buf_lift = None
         self._cached_n = 0
         self._cached_arrays = {}
         self.active_layer_idx = 0
@@ -218,23 +223,48 @@ class CartographicPipeline:
         update_progress(98, "Mesh loaded completely. Finalizing engine components...")
 
     def _warp_mesh_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, amplitude=35.0, k_decay=2.5):
-        """Warp mesh vertices on CPU using cached numpy view of VTK points."""
+        """Warp mesh vertices on CPU using contiguous buffers (avoids strided access)."""
         if self._original_mesh_z is None:
             return
-        # Cache the numpy view to avoid repeated vtk_to_numpy calls
+        # Cache the numpy view and allocate contiguous XY copy buffers on first call
         if self._cached_np_data is None:
             vtk_data = self.mesh.GetPoints().GetData()
             self._cached_n = self.mesh.GetPoints().GetNumberOfPoints()
             self._cached_np_data = vtk_to_numpy(vtk_data)
-        np_data = self._cached_np_data
-        # Compute warp in float32 to avoid float64 conversions
+            # Extract contiguous copies of X, Y columns to avoid strided access
+            self._buf_x = self._cached_np_data[:, 0].copy()
+            self._buf_y = self._cached_np_data[:, 1].copy()
+            self._buf_d = np.empty(self._cached_n, dtype=np.float32)
+            self._buf_temp = np.empty(self._cached_n, dtype=np.float32)
+            self._buf_lift = np.empty(self._cached_n, dtype=np.float32)
+
+        n = self._cached_n
         cx_f = np.float32(cx); cy_f = np.float32(cy)
         amp_f = np.float32(amplitude); decay_f = np.float32(k_decay)
         md_f = np.float32(max(max_dist, 1.0))
-        d = np.sqrt((np_data[:, 0] - cx_f)**2 + (np_data[:, 1] - cy_f)**2)
-        norm_dist = np.clip(d / md_f, np.float32(0.0), np.float32(1.0))
-        lift = amp_f * (np.float32(1.0) - np.exp(-decay_f * norm_dist))
-        np_data[:, 2] = self._original_mesh_z + lift
+        inv_md = np.float32(1.0) / md_f
+
+        # Use pre-allocated contiguous buffers with out= to avoid new allocations
+        np.subtract(self._buf_x, cx_f, out=self._buf_d)
+        np.multiply(self._buf_d, self._buf_d, out=self._buf_d)
+        np.subtract(self._buf_y, cy_f, out=self._buf_temp)
+        np.multiply(self._buf_temp, self._buf_temp, out=self._buf_temp)
+        np.add(self._buf_d, self._buf_temp, out=self._buf_d)
+        np.sqrt(self._buf_d, out=self._buf_d)
+        # d * inv_md then clip in one pass
+        np.multiply(self._buf_d, inv_md, out=self._buf_d)
+        np.clip(self._buf_d, np.float32(0.0), np.float32(1.0), out=self._buf_d)
+
+        # lift = amp * (1 - exp(-decay * normDist))
+        np.multiply(decay_f, self._buf_d, out=self._buf_d)
+        np.negative(self._buf_d, out=self._buf_d)
+        np.exp(self._buf_d, out=self._buf_lift)
+        np.negative(self._buf_lift, out=self._buf_lift)
+        np.add(self._buf_lift, np.float32(1.0), out=self._buf_lift)
+        np.multiply(amp_f, self._buf_lift, out=self._buf_lift)
+
+        # Write back to VTK points via strided view (single pass)
+        np.add(self._original_mesh_z, self._buf_lift, out=self._cached_np_data[:, 2])
         self.mesh.GetPoints().GetData().Modified()
 
     def _inject_shaders(self, warp_cx=0.0, warp_cy=0.0, warp_max_dist=1.0, warp_amplitude=35.0, warp_k_decay=2.5):
