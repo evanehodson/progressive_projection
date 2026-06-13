@@ -85,6 +85,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._block_updates = False
         self.worker = None
         self._settle_in_progress = False
+        self._current_warp_profile = None
         self._update_settled_timer = QtCore.QTimer()
         self._update_settled_timer.setSingleShot(True)
         self._update_settled_timer.timeout.connect(self._on_active_updates_settled)
@@ -152,7 +153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         warp_group = QtWidgets.QGroupBox("Funnel Geometry Deformation Curve")
         warp_layout = QtWidgets.QVBoxLayout(warp_group)
         self.curves = DeformationControls()
-        self.curves.valuesChanged.connect(self.route_hardware_updates)
+        self.curves.warpProfileChanged.connect(self._on_warp_profile)
         warp_layout.addWidget(self.curves)
         self.sidebar_layout.addWidget(warp_group)
         
@@ -232,8 +233,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents()
 
             # Pre-seed warp buffers for both proxy and full mesh
-            self.pipeline._warp_proxy_cpu(0.0, 0.0, 1.0, 0.0, 1.0)
-            self.pipeline._warp_mesh_cpu(0.0, 0.0, 1.0, 0.0, 1.0)
+            seed_profile = np.zeros(256, dtype=np.float32)
+            self.pipeline._warp_proxy_cpu(0.0, 0.0, 1.0, seed_profile)
+            self.pipeline._warp_mesh_cpu(0.0, 0.0, 1.0, seed_profile)
 
             self.plotter.reset_camera()
             
@@ -253,6 +255,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline.update_hardware_lut(idx)
         self.plotter.render()
 
+    def _on_warp_profile(self, profile):
+        self._current_warp_profile = profile
+        self.route_hardware_updates()
+
     def route_hardware_updates(self, *args):
         if self._block_updates or not self.pipeline.mesh or not self.pipeline.mesh_actor:
             return
@@ -260,9 +266,10 @@ class MainWindow(QtWidgets.QMainWindow):
         import sys, traceback
         try:
             cx, cy = self.minimap.get_mesh_coords()
-            amp = float(self.curves.amp_slider.value())
-            decay = float(self.curves.decay_slider.value() / 10.0)
-            
+            profile = self._current_warp_profile
+            if profile is None:
+                return
+
             alt_factor = float(self.curves.alt_slider.value() / 100.0)
             if alt_factor <= 0: alt_factor = 0.1
 
@@ -272,7 +279,7 @@ class MainWindow(QtWidgets.QMainWindow):
             max_dist = float(np.max(np.sqrt((corners[:, 0] - cx)**2 + (corners[:, 1] - cy)**2)))
             if max_dist <= 0: max_dist = 1.0
 
-            self.pipeline._warp_proxy_cpu(cx, cy, max_dist, amp, decay)
+            self.pipeline._warp_proxy_cpu(cx, cy, max_dist, profile)
             if not self.pipeline._using_proxy:
                 self.pipeline.swap_to_proxy()
 
@@ -315,14 +322,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             cx, cy = self.minimap.get_mesh_coords()
-            amp = float(self.curves.amp_slider.value())
-            decay = float(self.curves.decay_slider.value() / 10.0)
+            profile = self._current_warp_profile
+            if profile is None:
+                return
             xmin, xmax, ymin, ymax = self.pipeline.mesh.bounds[:4]
             corners = np.array([[xmin, ymin], [xmin, ymax], [xmax, ymin], [xmax, ymax]])
             max_dist = float(np.max(np.sqrt((corners[:, 0] - cx)**2 + (corners[:, 1] - cy)**2)))
             if max_dist <= 0: max_dist = 1.0
 
-            self.pipeline._warp_mesh_cpu(cx, cy, max_dist, amp, decay)
+            self.pipeline._warp_mesh_cpu(cx, cy, max_dist, profile)
             self.pipeline.swap_to_full()
             self.plotter.render()
 

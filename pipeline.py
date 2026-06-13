@@ -18,7 +18,7 @@ class CartographicPipeline:
         self._buf_y = None
         self._buf_d = None
         self._buf_temp = None
-        self._buf_lift = None
+        self._buf_depression = None
         self._cached_n = 0
         self._cached_arrays = {}
         self.active_layer_idx = 0
@@ -31,7 +31,7 @@ class CartographicPipeline:
         self._proxy_buf_y = None
         self._proxy_buf_d = None
         self._proxy_buf_temp = None
-        self._proxy_buf_lift = None
+        self._proxy_buf_depression = None
         self._proxy_cached_n = 0
         self._using_proxy = False
         
@@ -249,9 +249,11 @@ class CartographicPipeline:
         self._proxy_mesh = pv.wrap(proxy_pd)
         self._proxy_original_z = self._proxy_mesh.points[:, 2].copy()
 
-    def _warp_mesh_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, amplitude=35.0, k_decay=2.5):
-        """Warp mesh vertices on CPU using contiguous buffers (avoids strided access)."""
+    def _warp_mesh_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, profile=None):
+        """Warp mesh vertices on CPU using a sampled profile curve."""
         if self._original_mesh_z is None:
+            return
+        if profile is None or len(profile) < 2:
             return
         if self._cached_np_data is None:
             vtk_data = self.mesh.GetPoints().GetData()
@@ -261,11 +263,9 @@ class CartographicPipeline:
             self._buf_y = self._cached_np_data[:, 1].copy()
             self._buf_d = np.empty(self._cached_n, dtype=np.float32)
             self._buf_temp = np.empty(self._cached_n, dtype=np.float32)
-            self._buf_lift = np.empty(self._cached_n, dtype=np.float32)
+            self._buf_depression = np.empty(self._cached_n, dtype=np.float32)
 
-        n = self._cached_n
         cx_f = np.float32(cx); cy_f = np.float32(cy)
-        amp_f = np.float32(amplitude); decay_f = np.float32(k_decay)
         md_f = np.float32(max(max_dist, 1.0))
         inv_md = np.float32(1.0) / md_f
 
@@ -279,19 +279,17 @@ class CartographicPipeline:
         np.multiply(self._buf_d, inv_md, out=self._buf_d)
         np.clip(self._buf_d, np.float32(0.0), np.float32(1.0), out=self._buf_d)
 
-        np.multiply(decay_f, self._buf_d, out=self._buf_d)
-        np.negative(self._buf_d, out=self._buf_d)
-        np.exp(self._buf_d, out=self._buf_lift)
-        np.negative(self._buf_lift, out=self._buf_lift)
-        np.add(self._buf_lift, np.float32(1.0), out=self._buf_lift)
-        np.multiply(amp_f, self._buf_lift, out=self._buf_lift)
+        lookup_x = np.linspace(0.0, 1.0, len(profile), dtype=np.float32)
+        self._buf_depression = np.interp(self._buf_d, lookup_x, profile.astype(np.float32, copy=False))
 
-        np.add(self._original_mesh_z, self._buf_lift, out=self._cached_np_data[:, 2])
+        np.add(self._original_mesh_z, self._buf_depression, out=self._cached_np_data[:, 2])
         self.mesh.GetPoints().GetData().Modified()
 
-    def _warp_proxy_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, amplitude=35.0, k_decay=2.5):
-        """Warp the proxy mesh with same formula, fast path for interactive use."""
+    def _warp_proxy_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, profile=None):
+        """Warp the proxy mesh with sampled profile, fast path for interactive use."""
         if self._proxy_original_z is None or self._proxy_mesh is None:
+            return
+        if profile is None or len(profile) < 2:
             return
         if self._proxy_np_data is None:
             vtk_data = self._proxy_mesh.GetPoints().GetData()
@@ -301,11 +299,9 @@ class CartographicPipeline:
             self._proxy_buf_y = self._proxy_np_data[:, 1].copy()
             self._proxy_buf_d = np.empty(self._proxy_cached_n, dtype=np.float32)
             self._proxy_buf_temp = np.empty(self._proxy_cached_n, dtype=np.float32)
-            self._proxy_buf_lift = np.empty(self._proxy_cached_n, dtype=np.float32)
+            self._proxy_buf_depression = np.empty(self._proxy_cached_n, dtype=np.float32)
 
-        n = self._proxy_cached_n
         cx_f = np.float32(cx); cy_f = np.float32(cy)
-        amp_f = np.float32(amplitude); decay_f = np.float32(k_decay)
         md_f = np.float32(max(max_dist, 1.0))
         inv_md = np.float32(1.0) / md_f
 
@@ -319,34 +315,19 @@ class CartographicPipeline:
         np.multiply(self._proxy_buf_d, inv_md, out=self._proxy_buf_d)
         np.clip(self._proxy_buf_d, np.float32(0.0), np.float32(1.0), out=self._proxy_buf_d)
 
-        np.multiply(decay_f, self._proxy_buf_d, out=self._proxy_buf_d)
-        np.negative(self._proxy_buf_d, out=self._proxy_buf_d)
-        np.exp(self._proxy_buf_d, out=self._proxy_buf_lift)
-        np.negative(self._proxy_buf_lift, out=self._proxy_buf_lift)
-        np.add(self._proxy_buf_lift, np.float32(1.0), out=self._proxy_buf_lift)
-        np.multiply(amp_f, self._proxy_buf_lift, out=self._proxy_buf_lift)
+        lookup_x = np.linspace(0.0, 1.0, len(profile), dtype=np.float32)
+        self._proxy_buf_depression = np.interp(self._proxy_buf_d, lookup_x, profile.astype(np.float32, copy=False))
 
-        np.add(self._proxy_original_z, self._proxy_buf_lift, out=self._proxy_np_data[:, 2])
+        np.add(self._proxy_original_z, self._proxy_buf_depression, out=self._proxy_np_data[:, 2])
         self._proxy_mesh.GetPoints().GetData().Modified()
 
-    def _inject_shaders(self, warp_cx=0.0, warp_cy=0.0, warp_max_dist=1.0, warp_amplitude=35.0, warp_k_decay=2.5):
+    def _inject_shaders(self, warp_cx=0.0, warp_cy=0.0, warp_max_dist=1.0, profile=None):
+        # GPU shader path disabled — CPU path used instead
+        # To re-enable, profile would need to be baked as a 1D texture
         sp = self.mesh_actor.GetShaderProperty()
         sp.ClearAllShaderReplacements()
 
-        # Burn values directly into shader code to avoid VTK uniform binding issues
-        safe_md = max(float(warp_max_dist), 1.0)
-        warp_code = f"""
-            float _pp_d = distance(vertexMC.xy, vec2({warp_cx:.10f}, {warp_cy:.10f}));
-            float _pp_normDist = clamp(_pp_d / {safe_md:.10f}, 0.0, 1.0);
-            float _pp_verticalLift = {warp_amplitude:.10f} * (1.0 - exp(-{warp_k_decay:.10f} * _pp_normDist));
-            vec4 _pp_warped = vec4(vertexMC.x, vertexMC.y, vertexMC.z + _pp_verticalLift, 1.0);
-            vertexVCVSOutput = MCVCMatrix * _pp_warped;
-            gl_Position = MCDCMatrix * _pp_warped;
-        """
-        sp.AddVertexShaderReplacement("//VTK::PositionVC::Impl", True, warp_code, False)
-
-    def update_shader_uniforms(self, cx, cy, max_dist, amplitude, k_decay):
-        # NO-OP: values are now burned into shader code via _inject_shaders
+    def update_shader_uniforms(self, cx, cy, max_dist, profile):
         pass
 
     def swap_to_proxy(self):
