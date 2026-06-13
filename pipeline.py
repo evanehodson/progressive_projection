@@ -13,6 +13,8 @@ class CartographicPipeline:
         self.mesh_actor = None
         self.lightweight_points = None
         self._original_mesh_z = None  # store original Z for CPU warping
+        self._cached_np_data = None   # cached numpy view of VTK points
+        self._cached_n = 0
         self._cached_arrays = {}
         self.active_layer_idx = 0
         
@@ -216,20 +218,24 @@ class CartographicPipeline:
         update_progress(98, "Mesh loaded completely. Finalizing engine components...")
 
     def _warp_mesh_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, amplitude=35.0, k_decay=2.5):
-        """Warp mesh vertices on CPU using direct VTK array access."""
+        """Warp mesh vertices on CPU using cached numpy view of VTK points."""
         if self._original_mesh_z is None:
             return
-        # Access VTK points data array directly (no PyVista property overhead)
-        vtk_data = self.mesh.GetPoints().GetData()
-        n = self.mesh.GetPoints().GetNumberOfPoints()
-        # vtk_to_numpy shares memory when types match (VTK_FLOAT = float32)
-        np_data = vtk_to_numpy(vtk_data)
-        d = np.sqrt((np_data[:, 0] - cx)**2 + (np_data[:, 1] - cy)**2)
-        safe_md = max(float(max_dist), 1.0)
-        norm_dist = np.clip(d / safe_md, 0.0, 1.0)
-        lift = amplitude * (1.0 - np.exp(-k_decay * norm_dist))
+        # Cache the numpy view to avoid repeated vtk_to_numpy calls
+        if self._cached_np_data is None:
+            vtk_data = self.mesh.GetPoints().GetData()
+            self._cached_n = self.mesh.GetPoints().GetNumberOfPoints()
+            self._cached_np_data = vtk_to_numpy(vtk_data)
+        np_data = self._cached_np_data
+        # Compute warp in float32 to avoid float64 conversions
+        cx_f = np.float32(cx); cy_f = np.float32(cy)
+        amp_f = np.float32(amplitude); decay_f = np.float32(k_decay)
+        md_f = np.float32(max(max_dist, 1.0))
+        d = np.sqrt((np_data[:, 0] - cx_f)**2 + (np_data[:, 1] - cy_f)**2)
+        norm_dist = np.clip(d / md_f, np.float32(0.0), np.float32(1.0))
+        lift = amp_f * (np.float32(1.0) - np.exp(-decay_f * norm_dist))
         np_data[:, 2] = self._original_mesh_z + lift
-        vtk_data.Modified()
+        self.mesh.GetPoints().GetData().Modified()
 
     def _inject_shaders(self, warp_cx=0.0, warp_cy=0.0, warp_max_dist=1.0, warp_amplitude=35.0, warp_k_decay=2.5):
         sp = self.mesh_actor.GetShaderProperty()
