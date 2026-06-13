@@ -218,8 +218,16 @@ class MainWindow(QtWidgets.QMainWindow):
             prop.FrontfaceCullingOff()
             prop.SetInterpolationToGouraud()
 
-            self.pipeline._inject_shaders()
             self.pipeline.update_hardware_lut()
+
+            # Pre-seed warp shader BEFORE any render happens, with initial defaults
+            xmin, xmax, ymin, ymax, zmin, zmax = self.pipeline.mesh.bounds
+            cx = (xmin + xmax) / 2.0
+            cy = (ymin + ymax) / 2.0
+            diagonal = np.sqrt((xmax - xmin)**2 + (ymax - ymin)**2)
+            max_dist = float(diagonal / 2.0)
+            # Use default slider values (amp=35, decay=2.5)
+            self.pipeline._inject_shaders(cx, cy, max_dist, 35.0, 2.5)
             
             self.plotter.reset_camera()
             
@@ -241,9 +249,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def route_hardware_updates(self, *args):
         if self._block_updates or not self.pipeline.mesh or not self.pipeline.mesh_actor: 
+            print(f"[DBG route] guarded: block={self._block_updates} mesh={self.pipeline.mesh is not None} actor={self.pipeline.mesh_actor is not None}", flush=True)
             return
         
+        import sys, traceback
+        print(f"[DBG route] ENTERED route_hardware_updates args={args}", flush=True)
+        
         try:
+            import vtk; ref = vtk.reference
             cx, cy = self.minimap.get_mesh_coords()
             amp = float(self.curves.amp_slider.value())
             decay = float(self.curves.decay_slider.value() / 10.0)
@@ -257,7 +270,19 @@ class MainWindow(QtWidgets.QMainWindow):
             max_dist = float(np.max(np.sqrt((corners[:, 0] - cx)**2 + (corners[:, 1] - cy)**2)))
             if max_dist <= 0: max_dist = 1.0
 
-            self.pipeline.update_shader_uniforms(cx, cy, max_dist, amp, decay)
+            print(f"[DBG route] coords: cx={cx:.2f} cy={cy:.2f} amp={amp} decay={decay} alt_factor={alt_factor}", flush=True)
+            print(f"[DBG route] bounds: x[{xmin:.1f},{xmax:.1f}] y[{ymin:.1f},{ymax:.1f}] z[{zmin:.1f},{zmax:.1f}]", flush=True)
+            print(f"[DBG route] max_dist={max_dist:.2f}", flush=True)
+
+            # CPU warp (avoids GPU shader disappearing issue)
+            import time as _time
+            t0 = _time.time()
+            self.pipeline._warp_mesh_cpu(cx, cy, max_dist, amp, decay)
+            # Clear GPU shader replacements
+            self.pipeline.mesh_actor.GetShaderProperty().ClearAllShaderReplacements()
+            t1 = _time.time()
+            self.pipeline._original_mesh_z  # touch to ensure it's loaded
+            print(f"[DBG time] CPU warp: {(t1-t0)*1000:.1f}ms", flush=True)
 
             pts = self.pipeline.lightweight_points
             if pts is None or len(pts) == 0:
@@ -273,18 +298,60 @@ class MainWindow(QtWidgets.QMainWindow):
             pos_y = cy - (camera_distance * 0.4)
             pos_z = z_base + camera_distance
 
+            print(f"[DBG route] camera: pos=({pos_x:.2f}, {pos_y:.2f}, {pos_z:.2f}) focus=({cx:.2f}, {cy:.2f}, {z_base:.2f})", flush=True)
+            print(f"[DBG route] camera_distance={camera_distance:.2f} diagonal={diagonal:.2f}", flush=True)
+
             self.plotter.camera.position = (pos_x, pos_y, pos_z)
             self.plotter.camera.focal_point = (cx, cy, z_base)
             self.plotter.camera.up = (0.0, 0.0, 1.0)
-            
-            self.plotter.camera.clipping_range = (0.1, 1000.0)
-            self.plotter.camera.Modified()
+            self.plotter.camera.clipping_range = (0.1, 100000.0)
 
+            actor = self.pipeline.mesh_actor
+            print(f"[DBG route] actor visibility: {actor.GetVisibility()}", flush=True)
+            mapper = actor.GetMapper()
+
+            # Verify render window has valid size
+            rw_size = self.plotter.render_window.GetSize()
+            print(f"[DBG route] render_window size: {rw_size}", flush=True)
+            
+            # Verify camera state AFTER setting it
+            cam_pos = self.plotter.camera.position
+            cam_foc = self.plotter.camera.focal_point
+            cam_up = self.plotter.camera.up
+            cam_clip = self.plotter.camera.clipping_range
+            print(f"[DBG route] CAM POST-SET: pos={cam_pos} focus={cam_foc} up={cam_up} clip={cam_clip}", flush=True)
+
+            # Touch actor to pick up the modified mesh points on next render
+            actor.Modified()
+            
+            print(f"[DBG route] calling render()", flush=True)
             self.plotter.render()
+            print(f"[DBG route] render() returned", flush=True)
+
+            # Save screenshot to verify rendering output
+            try:
+                import os
+                ss_dir = os.path.join(os.path.dirname(__file__), "debug_screenshots")
+                if not os.path.exists(ss_dir):
+                    os.makedirs(ss_dir)
+                is_click = len(args) > 0
+                ss_path = os.path.join(ss_dir, f"after_render_{'click' if is_click else 'startup'}.png")
+                self.plotter.screenshot(ss_path)
+                print(f"[DBG route] screenshot saved to {ss_path}", flush=True)
+                # Check if the screenshot is mostly background color
+                from PIL import Image
+                img = Image.open(ss_path)
+                # Sample center pixel and corner pixel
+                w, h = img.size
+                center_pixel = img.getpixel((w//2, h//2))
+                corner_pixel = img.getpixel((0, 0))
+                print(f"[DBG route] center pixel: {center_pixel}, corner pixel: {corner_pixel}", flush=True)
+            except Exception as e4:
+                print(f"[DBG route] screenshot/pixel error: {e4}", flush=True)
 
         except Exception as e:
-            import traceback
             traceback.print_exc()
+            print(f"[DBG route] UNCAUGHT EXCEPTION: {e}", flush=True)
 
     def on_export_masks(self):
         self.pipeline.execute_multipass_export(self.plotter, base_filename="berann_export")

@@ -150,5 +150,8 @@ class MinimapWidget(QtWidgets.QWidget):
         # Evaluate crosshair alignment relative to corrected sub-grid space
         self.cx = np.clip((pos.x() - ox) / view_w, 0.0, 1.0)
         self.cy = np.clip(1.0 - ((pos.y() - oy) / view_h), 0.0, 1.0)
+        import sys
+        print(f"[DBG minimap] normalized coords: cx={self.cx:.6f} cy={self.cy:.6f}", flush=True)
         self.update()
+        print(f"[DBG minimap] emitting centerChanged({self.cx:.6f}, {self.cy:.6f})", flush=True)
         self.centerChanged.emit(self.cx, self.cy)

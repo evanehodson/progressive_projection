@@ -5,13 +5,14 @@ import sys
 import numpy as np
 import pyvista as pv
 import vtk
-from vtkmodules.util.numpy_support import numpy_to_vtk
+from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 
 class CartographicPipeline:
     def __init__(self):
         self.mesh = None
         self.mesh_actor = None
         self.lightweight_points = None
+        self._original_mesh_z = None  # store original Z for CPU warping
         self._cached_arrays = {}
         self.active_layer_idx = 0
         
@@ -167,6 +168,9 @@ class CartographicPipeline:
         del cells, cells_flat
         gc.collect()
 
+        # Store original Z values for CPU warping
+        self._original_mesh_z = vertices[:, 2].copy()
+
         step = max(1, num_vertices // 40000)
         self.lightweight_points = vertices[::step, :].copy()
 
@@ -211,37 +215,41 @@ class CartographicPipeline:
 
         update_progress(98, "Mesh loaded completely. Finalizing engine components...")
 
-    def _inject_shaders(self):
+    def _warp_mesh_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, amplitude=35.0, k_decay=2.5):
+        """Warp mesh vertices on CPU using direct VTK array access."""
+        if self._original_mesh_z is None:
+            return
+        # Access VTK points data array directly (no PyVista property overhead)
+        vtk_data = self.mesh.GetPoints().GetData()
+        n = self.mesh.GetPoints().GetNumberOfPoints()
+        # vtk_to_numpy shares memory when types match (VTK_FLOAT = float32)
+        np_data = vtk_to_numpy(vtk_data)
+        d = np.sqrt((np_data[:, 0] - cx)**2 + (np_data[:, 1] - cy)**2)
+        safe_md = max(float(max_dist), 1.0)
+        norm_dist = np.clip(d / safe_md, 0.0, 1.0)
+        lift = amplitude * (1.0 - np.exp(-k_decay * norm_dist))
+        np_data[:, 2] = self._original_mesh_z + lift
+        vtk_data.Modified()
+
+    def _inject_shaders(self, warp_cx=0.0, warp_cy=0.0, warp_max_dist=1.0, warp_amplitude=35.0, warp_k_decay=2.5):
         sp = self.mesh_actor.GetShaderProperty()
         sp.ClearAllShaderReplacements()
 
-        decl_code = """
-            uniform vec2 u_focalCenter;
-            uniform float u_maxDist;
-            uniform float u_amplitude;
-            uniform float u_kDecay;
+        # Burn values directly into shader code to avoid VTK uniform binding issues
+        safe_md = max(float(warp_max_dist), 1.0)
+        warp_code = f"""
+            float _pp_d = distance(vertexMC.xy, vec2({warp_cx:.10f}, {warp_cy:.10f}));
+            float _pp_normDist = clamp(_pp_d / {safe_md:.10f}, 0.0, 1.0);
+            float _pp_verticalLift = {warp_amplitude:.10f} * (1.0 - exp(-{warp_k_decay:.10f} * _pp_normDist));
+            vec4 _pp_warped = vec4(vertexMC.x, vertexMC.y, vertexMC.z + _pp_verticalLift, 1.0);
+            vertexVCVSOutput = MCVCMatrix * _pp_warped;
+            gl_Position = MCDCMatrix * _pp_warped;
         """
-        sp.AddVertexShaderReplacement("//VTK::CustomUniforms::Dec", True, decl_code, False)
-
-        begin_code = """
-            float _pp_d = distance(vertexMC.xy, u_focalCenter);
-            float _pp_normDist = clamp(_pp_d / u_maxDist, 0.0, 1.0);
-            float _pp_verticalLift = u_amplitude * (1.0 - exp(-u_kDecay * _pp_normDist));
-            vec4 vertexMC = vec4(vertexMC.x, vertexMC.y, vertexMC.z + _pp_verticalLift, 1.0);
-        """
-        sp.AddVertexShaderReplacement("//VTK::CustomBegin::Impl", True, begin_code, False)
+        sp.AddVertexShaderReplacement("//VTK::PositionVC::Impl", True, warp_code, False)
 
     def update_shader_uniforms(self, cx, cy, max_dist, amplitude, k_decay):
-        if not self.mesh_actor: 
-            return
-
-        shader_params = self.mesh_actor.GetShaderProperty().GetVertexCustomUniforms()
-        safe_max_dist = max(float(max_dist), 1.0)
-        
-        shader_params.SetUniformf("u_amplitude", float(amplitude))
-        shader_params.SetUniformf("u_kDecay", float(k_decay))
-        shader_params.SetUniform2f("u_focalCenter", (float(cx), float(cy)))
-        shader_params.SetUniformf("u_maxDist", safe_max_dist)
+        # NO-OP: values are now burned into shader code via _inject_shaders
+        pass
 
     def update_hardware_lut(self, layer_idx=None):
         if layer_idx is not None:
