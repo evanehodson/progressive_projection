@@ -90,6 +90,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_settled_timer = QtCore.QTimer()
         self._update_settled_timer.setSingleShot(True)
         self._update_settled_timer.timeout.connect(self._on_active_updates_settled)
+
+        self._camera_azimuth = 0.0
+        self._camera_fov = 30.0
+        self._drag_start = None
         
         main_widget = QtWidgets.QWidget()
         self.setCentralWidget(main_widget)
@@ -109,6 +113,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plotter.set_background("#1e293b")
         if self.plotter.iren.get_interactor_style() is not None:
             self.plotter.iren.get_interactor_style().SetEnabled(False)
+        self.plotter.installEventFilter(self)
             
         plotter_layout.addWidget(self.plotter, 0, 0)
         layout.addWidget(self.plotter_container)
@@ -121,6 +126,71 @@ class MainWindow(QtWidgets.QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.loading_overlay.update_position()
+
+    def eventFilter(self, obj, event):
+        if obj == self.plotter:
+            if event.type() == QtCore.QEvent.Wheel:
+                delta = event.angleDelta().y()
+                self._camera_fov = max(5.0, min(120.0, self._camera_fov - delta / 120 * 2))
+                self.plotter.camera.SetViewAngle(self._camera_fov)
+                self.plotter.render()
+                return True
+            elif event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
+                self._drag_start = event.pos()
+                self._drag_azimuth = self._camera_azimuth
+                return True
+            elif event.type() == QtCore.QEvent.MouseMove and self._drag_start is not None:
+                if event.buttons() & QtCore.Qt.LeftButton:
+                    dx = event.pos().x() - self._drag_start.x()
+                    sensitivity = 0.3
+                    new_az = (self._drag_azimuth - dx * sensitivity) % 360
+                    if abs(new_az - self._camera_azimuth) > 0.01:
+                        self._camera_azimuth = new_az
+                        self.minimap.set_view_angle(self._camera_azimuth)
+                        self.route_hardware_updates()
+                    return True
+            elif event.type() == QtCore.QEvent.MouseButtonRelease:
+                self._drag_start = None
+                return True
+        return super().eventFilter(obj, event)
+
+    def _update_camera(self):
+        if not self.pipeline.mesh:
+            return
+        cx, cy = self.minimap.get_mesh_coords()
+        xmin, xmax, ymin, ymax, zmin, zmax = self.pipeline.mesh.bounds
+
+        pts = self.pipeline.lightweight_points
+        if pts is None or len(pts) == 0:
+            z_base = (zmin + zmax) / 2.0
+        else:
+            center_idx = np.argmin((pts[:, 0] - cx)**2 + (pts[:, 1] - cy)**2)
+            z_base = pts[center_idx, 2]
+
+        height_factor = float(self.curves.alt_slider.value() / 100.0)
+        if height_factor <= 0: height_factor = 0.1
+        diagonal = np.sqrt((xmax - xmin)**2 + (ymax - ymin)**2)
+        height = z_base + diagonal * height_factor
+
+        el_rad = math.radians(float(self.curves.tilt_slider.value()))
+        az_rad = math.radians(self._camera_azimuth)
+
+        if el_rad > 0.01:
+            cot_el = math.cos(el_rad) / math.sin(el_rad)
+            look_dist_h = (height - z_base) * cot_el
+            focal_x = cx + look_dist_h * math.sin(az_rad)
+            focal_y = cy + look_dist_h * math.cos(az_rad)
+            focal_z = z_base
+        else:
+            focal_x = cx + 10000 * math.sin(az_rad)
+            focal_y = cy + 10000 * math.cos(az_rad)
+            focal_z = z_base
+
+        self.plotter.camera.position = (cx, cy, height)
+        self.plotter.camera.focal_point = (focal_x, focal_y, focal_z)
+        self.plotter.camera.up = (0.0, 0.0, 1.0)
+        self.plotter.camera.clipping_range = (0.1, 100000.0)
+        self.plotter.camera.SetViewAngle(self._camera_fov)
 
     def create_menu_bar(self):
         menu_bar = self.menuBar()
@@ -155,7 +225,8 @@ class MainWindow(QtWidgets.QMainWindow):
         warp_layout = QtWidgets.QVBoxLayout(warp_group)
         self.curves = DeformationControls()
         self.curves.warpProfileChanged.connect(self._on_warp_profile)
-        self.curves.viewAngleChanged.connect(self.route_hardware_updates)
+        self.curves.alt_slider.valueChanged.connect(self.route_hardware_updates)
+        self.curves.tilt_slider.valueChanged.connect(self.route_hardware_updates)
         warp_layout.addWidget(self.curves)
         self.sidebar_layout.addWidget(warp_group)
         
@@ -264,19 +335,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def route_hardware_updates(self, *args):
         if self._block_updates or not self.pipeline.mesh or not self.pipeline.mesh_actor:
             return
-        
-        import sys, traceback
+
+        import traceback
         try:
             cx, cy = self.minimap.get_mesh_coords()
-            view_angle = float(self.curves.view_angle_slider.value())
+            view_angle = self._camera_azimuth
             profile = self._current_warp_profile
             if profile is None:
                 return
-
-            alt_factor = float(self.curves.alt_slider.value() / 100.0)
-            if alt_factor <= 0: alt_factor = 0.1
-
-            xmin, xmax, ymin, ymax, zmin, zmax = self.pipeline.mesh.bounds
 
             self.pipeline._warp_proxy_cpu(cx, cy, view_angle, profile)
             if not self.pipeline._using_proxy:
@@ -284,32 +350,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self.pipeline.mesh_actor.GetShaderProperty().ClearAllShaderReplacements()
 
-            pts = self.pipeline.lightweight_points
-            if pts is None or len(pts) == 0:
-                z_base = (zmin + zmax) / 2.0
-            else:
-                center_idx = np.argmin((pts[:, 0] - cx)**2 + (pts[:, 1] - cy)**2)
-                z_base = pts[center_idx, 2]
-            
-            diagonal = np.sqrt((xmax - xmin)**2 + (ymax - ymin)**2)
-            camera_distance = diagonal * alt_factor
-
-            theta_rad = math.radians(view_angle)
-            pos_x = cx - (camera_distance * 0.4) * math.sin(theta_rad)
-            pos_y = cy - (camera_distance * 0.4) * math.cos(theta_rad)
-            pos_z = z_base + camera_distance
-
-            self.plotter.camera.position = (pos_x, pos_y, pos_z)
-            self.plotter.camera.focal_point = (cx, cy, z_base)
-            self.plotter.camera.up = (0.0, 0.0, 1.0)
-            self.plotter.camera.clipping_range = (0.1, 100000.0)
-
-            self.minimap.set_view_angle(view_angle)
+            self._update_camera()
+            self.minimap.set_view_angle(self._camera_azimuth)
 
             self.pipeline.mesh_actor.Modified()
-
             self.plotter.render()
-
             self._update_settled_timer.start(400)
 
         except Exception as e:
@@ -324,7 +369,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             cx, cy = self.minimap.get_mesh_coords()
-            view_angle = float(self.curves.view_angle_slider.value())
+            view_angle = self._camera_azimuth
             profile = self._current_warp_profile
             if profile is None:
                 return

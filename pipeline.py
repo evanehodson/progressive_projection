@@ -286,7 +286,7 @@ class CartographicPipeline:
             depth_range = np.float32(1.0)
         inv_range = np.float32(1.0) / depth_range
 
-        np.subtract(v_max, self._buf_d, out=self._buf_d)
+        np.subtract(self._buf_d, v_min, out=self._buf_d)
         np.multiply(self._buf_d, inv_range, out=self._buf_d)
         np.clip(self._buf_d, np.float32(0.0), np.float32(1.0), out=self._buf_d)
 
@@ -333,7 +333,7 @@ class CartographicPipeline:
             depth_range = np.float32(1.0)
         inv_range = np.float32(1.0) / depth_range
 
-        np.subtract(v_max, self._proxy_buf_d, out=self._proxy_buf_d)
+        np.subtract(self._proxy_buf_d, v_min, out=self._proxy_buf_d)
         np.multiply(self._proxy_buf_d, inv_range, out=self._proxy_buf_d)
         np.clip(self._proxy_buf_d, np.float32(0.0), np.float32(1.0), out=self._proxy_buf_d)
 
