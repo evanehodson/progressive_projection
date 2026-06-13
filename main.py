@@ -84,6 +84,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline = CartographicPipeline()
         self._block_updates = False
         self.worker = None
+        self._settle_in_progress = False
+        self._update_settled_timer = QtCore.QTimer()
+        self._update_settled_timer.setSingleShot(True)
+        self._update_settled_timer.timeout.connect(self._on_active_updates_settled)
         
         main_widget = QtWidgets.QWidget()
         self.setCentralWidget(main_widget)
@@ -220,7 +224,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self.pipeline.update_hardware_lut()
 
-            # Pre-seed the mesh data cache before first render
+            # Create proxy mesh in main thread (VTK threading safety)
+            self.loading_overlay.set_value(95)
+            self.loading_overlay.show()
+            QtWidgets.QApplication.processEvents()
+            self.pipeline._create_proxy_mesh(divisions=200)
+            QtWidgets.QApplication.processEvents()
+
+            # Pre-seed warp buffers for both proxy and full mesh
+            self.pipeline._warp_proxy_cpu(0.0, 0.0, 1.0, 0.0, 1.0)
             self.pipeline._warp_mesh_cpu(0.0, 0.0, 1.0, 0.0, 1.0)
 
             self.plotter.reset_camera()
@@ -260,7 +272,10 @@ class MainWindow(QtWidgets.QMainWindow):
             max_dist = float(np.max(np.sqrt((corners[:, 0] - cx)**2 + (corners[:, 1] - cy)**2)))
             if max_dist <= 0: max_dist = 1.0
 
-            self.pipeline._warp_mesh_cpu(cx, cy, max_dist, amp, decay)
+            self.pipeline._warp_proxy_cpu(cx, cy, max_dist, amp, decay)
+            if not self.pipeline._using_proxy:
+                self.pipeline.swap_to_proxy()
+
             self.pipeline.mesh_actor.GetShaderProperty().ClearAllShaderReplacements()
 
             pts = self.pipeline.lightweight_points
@@ -283,10 +298,39 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plotter.camera.clipping_range = (0.1, 100000.0)
 
             self.pipeline.mesh_actor.Modified()
+
             self.plotter.render()
+
+            self._update_settled_timer.start(400)
 
         except Exception as e:
             traceback.print_exc()
+
+    def _on_active_updates_settled(self):
+        if self._settle_in_progress or not self.pipeline.mesh or not self.pipeline.mesh_actor:
+            return
+        self._settle_in_progress = True
+        try:
+            if self._block_updates:
+                return
+
+            cx, cy = self.minimap.get_mesh_coords()
+            amp = float(self.curves.amp_slider.value())
+            decay = float(self.curves.decay_slider.value() / 10.0)
+            xmin, xmax, ymin, ymax = self.pipeline.mesh.bounds[:4]
+            corners = np.array([[xmin, ymin], [xmin, ymax], [xmax, ymin], [xmax, ymax]])
+            max_dist = float(np.max(np.sqrt((corners[:, 0] - cx)**2 + (corners[:, 1] - cy)**2)))
+            if max_dist <= 0: max_dist = 1.0
+
+            self.pipeline._warp_mesh_cpu(cx, cy, max_dist, amp, decay)
+            self.pipeline.swap_to_full()
+            self.plotter.render()
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+        finally:
+            self._settle_in_progress = False
 
     def on_export_masks(self):
         self.pipeline.execute_multipass_export(self.plotter, base_filename="berann_export")

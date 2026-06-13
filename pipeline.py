@@ -22,6 +22,18 @@ class CartographicPipeline:
         self._cached_n = 0
         self._cached_arrays = {}
         self.active_layer_idx = 0
+
+        # Proxy mesh for interactive warping
+        self._proxy_mesh = None
+        self._proxy_original_z = None
+        self._proxy_np_data = None
+        self._proxy_buf_x = None
+        self._proxy_buf_y = None
+        self._proxy_buf_d = None
+        self._proxy_buf_temp = None
+        self._proxy_buf_lift = None
+        self._proxy_cached_n = 0
+        self._using_proxy = False
         
         self.nlcd_lut = self._build_nlcd_lookup_table()
         self.soil_lut = self._build_soil_lookup_table("soil_color_lookup_extended_na.csv")
@@ -222,16 +234,29 @@ class CartographicPipeline:
 
         update_progress(98, "Mesh loaded completely. Finalizing engine components...")
 
+    def _create_proxy_mesh(self, divisions=150):
+        """Create proxy mesh via QuadricClustering (memory-efficient for huge meshes)."""
+        import vtk as vtk_mod
+        cluster = vtk_mod.vtkQuadricClustering()
+        cluster.SetInputData(self.mesh)
+        cluster.SetNumberOfXDivisions(divisions)
+        cluster.SetNumberOfYDivisions(divisions)
+        cluster.SetNumberOfZDivisions(divisions)
+        cluster.UseInputPointsOn()
+        cluster.Update()
+        proxy_pd = vtk_mod.vtkPolyData()
+        proxy_pd.ShallowCopy(cluster.GetOutputDataObject(0))
+        self._proxy_mesh = pv.wrap(proxy_pd)
+        self._proxy_original_z = self._proxy_mesh.points[:, 2].copy()
+
     def _warp_mesh_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, amplitude=35.0, k_decay=2.5):
         """Warp mesh vertices on CPU using contiguous buffers (avoids strided access)."""
         if self._original_mesh_z is None:
             return
-        # Cache the numpy view and allocate contiguous XY copy buffers on first call
         if self._cached_np_data is None:
             vtk_data = self.mesh.GetPoints().GetData()
             self._cached_n = self.mesh.GetPoints().GetNumberOfPoints()
             self._cached_np_data = vtk_to_numpy(vtk_data)
-            # Extract contiguous copies of X, Y columns to avoid strided access
             self._buf_x = self._cached_np_data[:, 0].copy()
             self._buf_y = self._cached_np_data[:, 1].copy()
             self._buf_d = np.empty(self._cached_n, dtype=np.float32)
@@ -244,18 +269,16 @@ class CartographicPipeline:
         md_f = np.float32(max(max_dist, 1.0))
         inv_md = np.float32(1.0) / md_f
 
-        # Use pre-allocated contiguous buffers with out= to avoid new allocations
         np.subtract(self._buf_x, cx_f, out=self._buf_d)
         np.multiply(self._buf_d, self._buf_d, out=self._buf_d)
         np.subtract(self._buf_y, cy_f, out=self._buf_temp)
         np.multiply(self._buf_temp, self._buf_temp, out=self._buf_temp)
         np.add(self._buf_d, self._buf_temp, out=self._buf_d)
         np.sqrt(self._buf_d, out=self._buf_d)
-        # d * inv_md then clip in one pass
+
         np.multiply(self._buf_d, inv_md, out=self._buf_d)
         np.clip(self._buf_d, np.float32(0.0), np.float32(1.0), out=self._buf_d)
 
-        # lift = amp * (1 - exp(-decay * normDist))
         np.multiply(decay_f, self._buf_d, out=self._buf_d)
         np.negative(self._buf_d, out=self._buf_d)
         np.exp(self._buf_d, out=self._buf_lift)
@@ -263,9 +286,48 @@ class CartographicPipeline:
         np.add(self._buf_lift, np.float32(1.0), out=self._buf_lift)
         np.multiply(amp_f, self._buf_lift, out=self._buf_lift)
 
-        # Write back to VTK points via strided view (single pass)
         np.add(self._original_mesh_z, self._buf_lift, out=self._cached_np_data[:, 2])
         self.mesh.GetPoints().GetData().Modified()
+
+    def _warp_proxy_cpu(self, cx=0.0, cy=0.0, max_dist=1.0, amplitude=35.0, k_decay=2.5):
+        """Warp the proxy mesh with same formula, fast path for interactive use."""
+        if self._proxy_original_z is None or self._proxy_mesh is None:
+            return
+        if self._proxy_np_data is None:
+            vtk_data = self._proxy_mesh.GetPoints().GetData()
+            self._proxy_cached_n = self._proxy_mesh.GetPoints().GetNumberOfPoints()
+            self._proxy_np_data = vtk_to_numpy(vtk_data)
+            self._proxy_buf_x = self._proxy_np_data[:, 0].copy()
+            self._proxy_buf_y = self._proxy_np_data[:, 1].copy()
+            self._proxy_buf_d = np.empty(self._proxy_cached_n, dtype=np.float32)
+            self._proxy_buf_temp = np.empty(self._proxy_cached_n, dtype=np.float32)
+            self._proxy_buf_lift = np.empty(self._proxy_cached_n, dtype=np.float32)
+
+        n = self._proxy_cached_n
+        cx_f = np.float32(cx); cy_f = np.float32(cy)
+        amp_f = np.float32(amplitude); decay_f = np.float32(k_decay)
+        md_f = np.float32(max(max_dist, 1.0))
+        inv_md = np.float32(1.0) / md_f
+
+        np.subtract(self._proxy_buf_x, cx_f, out=self._proxy_buf_d)
+        np.multiply(self._proxy_buf_d, self._proxy_buf_d, out=self._proxy_buf_d)
+        np.subtract(self._proxy_buf_y, cy_f, out=self._proxy_buf_temp)
+        np.multiply(self._proxy_buf_temp, self._proxy_buf_temp, out=self._proxy_buf_temp)
+        np.add(self._proxy_buf_d, self._proxy_buf_temp, out=self._proxy_buf_d)
+        np.sqrt(self._proxy_buf_d, out=self._proxy_buf_d)
+
+        np.multiply(self._proxy_buf_d, inv_md, out=self._proxy_buf_d)
+        np.clip(self._proxy_buf_d, np.float32(0.0), np.float32(1.0), out=self._proxy_buf_d)
+
+        np.multiply(decay_f, self._proxy_buf_d, out=self._proxy_buf_d)
+        np.negative(self._proxy_buf_d, out=self._proxy_buf_d)
+        np.exp(self._proxy_buf_d, out=self._proxy_buf_lift)
+        np.negative(self._proxy_buf_lift, out=self._proxy_buf_lift)
+        np.add(self._proxy_buf_lift, np.float32(1.0), out=self._proxy_buf_lift)
+        np.multiply(amp_f, self._proxy_buf_lift, out=self._proxy_buf_lift)
+
+        np.add(self._proxy_original_z, self._proxy_buf_lift, out=self._proxy_np_data[:, 2])
+        self._proxy_mesh.GetPoints().GetData().Modified()
 
     def _inject_shaders(self, warp_cx=0.0, warp_cy=0.0, warp_max_dist=1.0, warp_amplitude=35.0, warp_k_decay=2.5):
         sp = self.mesh_actor.GetShaderProperty()
@@ -286,6 +348,28 @@ class CartographicPipeline:
     def update_shader_uniforms(self, cx, cy, max_dist, amplitude, k_decay):
         # NO-OP: values are now burned into shader code via _inject_shaders
         pass
+
+    def swap_to_proxy(self):
+        if self._proxy_mesh is None or self.mesh_actor is None:
+            return
+        self.mesh_actor.GetMapper().SetInputData(self._proxy_mesh)
+        self._using_proxy = True
+        # Proxy lacks cell data arrays (landcover, soil) — fall back to Hillshade
+        if self.active_layer_idx in (4, 5):
+            self._saved_layer = self.active_layer_idx
+            self.update_hardware_lut(0)
+        self.mesh_actor.Modified()
+
+    def swap_to_full(self):
+        if self.mesh_actor is None:
+            return
+        self.mesh_actor.GetMapper().SetInputData(self.mesh)
+        self._using_proxy = False
+        saved = getattr(self, '_saved_layer', None)
+        if saved is not None:
+            self.update_hardware_lut(saved)
+            self._saved_layer = None
+        self.mesh_actor.Modified()
 
     def update_hardware_lut(self, layer_idx=None):
         if layer_idx is not None:
@@ -336,6 +420,10 @@ class CartographicPipeline:
 
     def execute_multipass_export(self, plotter, base_filename="export"):
         if not self.mesh_actor: return
+        # Always use the full-resolution mesh for export
+        if self._using_proxy:
+            self.swap_to_full()
+            plotter.render()
         plotter.render_window.SetAnimate(0)
         original_layer = self.active_layer_idx
         layer_names = ["Hillshade", "AO", "Texture", "Vegetation", "Landcover", "Soil"]
