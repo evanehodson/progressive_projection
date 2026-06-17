@@ -11,7 +11,7 @@ class WarpCurveEditor(QtWidgets.QWidget):
         self.setMouseTracking(True)
 
         self._max_y = float(max_raise)
-        self._points = [(0.0, 0.0), (0.1, 0.08), (0.3, 0.14), (1.0, 0.2)]
+        self._points = [(0.0, 0.18), (1.0, 0.22)]
         self._drag_idx = -1
         self._sample_count = 256
         self._hover_idx = -1
@@ -130,6 +130,14 @@ class WarpCurveEditor(QtWidgets.QWidget):
         qp.drawLine(self._pad_left, self._pad_top, self._pad_left, self._pad_top + h)
         qp.drawLine(self._pad_left, self._pad_top + h, self._pad_left + w, self._pad_top + h)
 
+        # Flat reference line at multiplier = 1.0 (Y = 0.2 in widget coords)
+        flat_y = 1.0 / self._max_y if self._max_y > 0 else 0.5
+        if 0.0 <= flat_y <= 1.0:
+            ref_pen = QtGui.QPen(QtGui.QColor("#64748b"), 1, QtCore.Qt.DashLine)
+            qp.setPen(ref_pen)
+            _, ref_py = self._to_widget(0.0, flat_y)
+            qp.drawLine(self._pad_left, int(ref_py), self._pad_left + w, int(ref_py))
+
         # Labels
         font = qp.font()
         font.setPointSize(7)
@@ -139,6 +147,17 @@ class WarpCurveEditor(QtWidgets.QWidget):
                      QtCore.Qt.AlignLeft, "Foreground")
         qp.drawText(self._pad_left + w - 50, self._pad_top + h + 4, 50, 14,
                      QtCore.Qt.AlignRight, "Horizon")
+
+        # Y-axis multiplier labels
+        font.setPointSize(7)
+        qp.setFont(font)
+        qp.setPen(label_color)
+        for mv in range(0, 6):
+            ny = mv / self._max_y
+            if 0.0 <= ny <= 1.0:
+                _, py = self._to_widget(0.0, ny)
+                qp.drawText(2, int(py) - 6, self._pad_left - 4, 12,
+                             QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, str(mv))
 
         # Curve
         ys = self._sample_curve()
@@ -191,8 +210,6 @@ class WarpCurveEditor(QtWidgets.QWidget):
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
             for i, (x, y) in enumerate(self._points):
-                if i == 0:
-                    continue
                 px, py = self._to_widget(x, y)
                 dx = event.pos().x() - px
                 dy = event.pos().y() - py
@@ -205,11 +222,12 @@ class WarpCurveEditor(QtWidgets.QWidget):
             xn, yn = self._from_widget(event.pos().x(), event.pos().y())
             xn = np.clip(xn, 0.0, 1.0)
             yn = np.clip(yn, 0.0, 1.0)
-            if self._drag_idx == len(self._points) - 1:
+            if self._drag_idx == 0:
+                xn = 0.0
+            elif self._drag_idx == len(self._points) - 1:
                 xn = 1.0
-            elif self._drag_idx > 0:
+            else:
                 xn = max(xn, self._points[self._drag_idx - 1][0] + 0.005)
-            if self._drag_idx < len(self._points) - 1:
                 xn = min(xn, self._points[self._drag_idx + 1][0] - 0.005)
             self._points[self._drag_idx] = (xn, yn)
             self.update()
@@ -217,8 +235,6 @@ class WarpCurveEditor(QtWidgets.QWidget):
         else:
             self._hover_idx = -1
             for i, (x, y) in enumerate(self._points):
-                if i == 0:
-                    continue
                 px, py = self._to_widget(x, y)
                 dx = event.pos().x() - px
                 dy = event.pos().y() - py
@@ -268,7 +284,7 @@ class DeformationControls(QtWidgets.QWidget):
 
         layout.addWidget(QtWidgets.QLabel("Camera Height Above Terrain:"))
         self.alt_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.alt_slider.setRange(1, 2000)
+        self.alt_slider.setRange(1, 100)
         layout.addWidget(self.alt_slider)
 
         layout.addWidget(QtWidgets.QLabel("Camera Tilt Angle:"))
@@ -278,6 +294,6 @@ class DeformationControls(QtWidgets.QWidget):
         layout.addWidget(self.tilt_slider)
 
     def calibrate_ranges(self, diagonal):
-        self.alt_slider.setRange(1, 200)
-        self.alt_slider.setValue(50)
-        self.curve_editor.set_max_raise(diagonal * 0.25)
+        self.alt_slider.setRange(1, 100)
+        self.alt_slider.setValue(30)
+        self.curve_editor.set_max_raise(5.0)

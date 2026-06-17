@@ -7,9 +7,9 @@ class CameraState:
     cx: float = 0.0
     cy: float = 0.0
     azimuth: float = 0.0
-    tilt: float = 45.0
-    height_factor: float = 0.5
-    fov: float = 30.0
+    tilt: float = 70.0
+    height_factor: float = 0.3
+    fov: float = 25.0
     profile: np.ndarray = None
 
     def asdict(self):
@@ -44,11 +44,9 @@ class BerannCamera:
             (self.x_max - state.cx) * self.sin_a + (self.y_min - state.cy) * self.cos_a,
             (self.x_max - state.cx) * self.sin_a + (self.y_max - state.cy) * self.cos_a,
         ]
-        self.v_min = min(corner_d)
-        self.v_max = max(corner_d)
-        self.v_range = self.v_max - self.v_min
-        if self.v_range <= 0:
-            self.v_range = 1.0
+        self.max_forward_dist = max(corner_d)
+        if self.max_forward_dist <= 0:
+            self.max_forward_dist = 1.0
 
     def _get_cam_height(self):
         return self._z_base + self.diagonal * self.state.height_factor
@@ -125,4 +123,4 @@ class BerannCamera:
         origins[:, :, 1] = cam_pos[1]
         origins[:, :, 2] = cam_pos[2]
 
-        return rays, origins, self.v_min, self.v_range, self.sin_a, self.cos_a
+        return rays, origins

@@ -25,13 +25,17 @@ def compose_viewport(gbuffer, light_dir=None):
     hillshade[depth < 0] = 0.0
 
     soil_f = soil_color.astype(np.float32) / 255.0
-    base = soil_f * hillshade[..., np.newaxis] * shadow[..., np.newaxis]
+
+    ambient = 0.25
+    lighting = ambient + (1.0 - ambient) * hillshade[..., np.newaxis]
+    shadow_light = 0.3 + 0.7 * shadow[..., np.newaxis]
+    base = soil_f * lighting * shadow_light
 
     from raster_stack import EVC_DISPLAY_LUT
     lc_clamped = np.clip(landcover, 0, len(EVC_DISPLAY_LUT) - 1)
     tint = EVC_DISPLAY_LUT[lc_clamped].astype(np.float32) / 255.0
 
-    color = base * 0.6 + tint * 0.4
+    color = base * 0.9 + tint * 0.1
 
     color = np.clip(color * 255.0, 0, 255).astype(np.uint8)
 

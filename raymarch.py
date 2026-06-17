@@ -47,7 +47,7 @@ def raymarch_kernel(
     soil_lut,
     profile,
     rays, origins,
-    v_min, v_range, sin_a, cos_a, cx, cy, z_base,
+    sin_a, cos_a, max_forward_dist, z_base,
     out_w, out_h,
     dem_x0, dem_y0, dem_res,
     dem_H, dem_W,
@@ -118,19 +118,19 @@ def raymarch_kernel(
                 if abs(dem_h) > 1e10:
                     continue
 
-                # Berann-modified terrain height
-                d_val = (px - cx) * sin_a + (py - cy) * cos_a
-                d_norm = (d_val - v_min) / v_range
-                if d_norm < 0.0:
-                    d_norm = 0.0
-                if d_norm > 1.0:
-                    d_norm = 1.0
-
-                dep_idx = int(d_norm * 255.0)
+                # Berann-modified terrain height (multiplicative exaggeration)
+                # Scale follows horizontal forward distance along the DEM (azimuth direction)
+                forward_dist = (px - ox) * sin_a + (py - oy) * cos_a
+                f_norm = forward_dist / max_forward_dist
+                if f_norm < 0.0:
+                    f_norm = 0.0
+                if f_norm > 1.0:
+                    f_norm = 1.0
+                dep_idx = int(f_norm * 255.0)
                 if dep_idx >= profile_len:
                     dep_idx = profile_len - 1
 
-                terrain_z = dem_h + profile[dep_idx]
+                terrain_z = dem_h * profile[dep_idx]
 
                 if pz < terrain_z:
                     # Back up to just before crossing
@@ -157,16 +157,16 @@ def raymarch_kernel(
                     mdr = (dem_y0 - mpy) / dem_res
                     mh = sample_dem(dem, mdr, mdc, dem_H, dem_W, dem_nodata)
 
-                    md_val = (mpx - cx) * sin_a + (mpy - cy) * cos_a
-                    md_norm = (md_val - v_min) / v_range
-                    if md_norm < 0.0:
-                        md_norm = 0.0
-                    if md_norm > 1.0:
-                        md_norm = 1.0
-                    mdep_idx = int(md_norm * 255.0)
+                    mforward_dist = (mpx - ox) * sin_a + (mpy - oy) * cos_a
+                    mf_norm = mforward_dist / max_forward_dist
+                    if mf_norm < 0.0:
+                        mf_norm = 0.0
+                    if mf_norm > 1.0:
+                        mf_norm = 1.0
+                    mdep_idx = int(mf_norm * 255.0)
                     if mdep_idx >= profile_len:
                         mdep_idx = profile_len - 1
-                    mterrain_z = mh + profile[mdep_idx]
+                    mterrain_z = mh * profile[mdep_idx]
 
                     if mpz < mterrain_z:
                         high_t = mid_t
@@ -185,6 +185,18 @@ def raymarch_kernel(
 
                 out_depth[row, col] = hit_t
 
+                # Exaggeration factor at the exact hit position
+                hforward_dist = (hx - ox) * sin_a + (hy - oy) * cos_a
+                hf_norm = hforward_dist / max_forward_dist
+                if hf_norm < 0.0:
+                    hf_norm = 0.0
+                if hf_norm > 1.0:
+                    hf_norm = 1.0
+                hdep_idx = int(hf_norm * 255.0)
+                if hdep_idx >= profile_len:
+                    hdep_idx = profile_len - 1
+                exag_hit = profile[hdep_idx]
+
                 h_dr0 = int(hdr)
                 h_dc0 = int(hdc)
                 if 0 <= h_dr0 < dem_H - 1 and 0 <= h_dc0 < dem_W - 1:
@@ -201,8 +213,8 @@ def raymarch_kernel(
                         dz_dx = ((z01 - z00) + (z11 - z10)) / wx
                         dz_dy = ((z10 - z00) + (z11 - z01)) / wy
 
-                        nx = -dz_dx
-                        ny = -dz_dy
+                        nx = -dz_dx * exag_hit
+                        ny = -dz_dy * exag_hit
                         nz = 1.0
                         nlen = (nx * nx + ny * ny + nz * nz) ** 0.5
                         if nlen > 1e-10:
@@ -254,16 +266,16 @@ def raymarch_kernel(
 
 def raymarch(stack, camera, out_w, out_h, quality_tier="settled"):
     if quality_tier == "interactive":
-        max_steps_coarse = 12
-        max_steps_binary = 6
-        max_dist_m = 1000000.0
-    elif quality_tier == "settled":
         max_steps_coarse = 20
         max_steps_binary = 8
         max_dist_m = 1000000.0
+    elif quality_tier == "settled":
+        max_steps_coarse = 32
+        max_steps_binary = 10
+        max_dist_m = 1000000.0
     else:
         max_steps_coarse = 64
-        max_steps_binary = 10
+        max_steps_binary = 12
         max_dist_m = 1000000.0
 
     (dem_filled, landcover, soil_codes, shadow,
@@ -272,9 +284,16 @@ def raymarch(stack, camera, out_w, out_h, quality_tier="settled"):
 
     profile = camera.state.profile
     if profile is None or len(profile) < 2:
-        profile = np.zeros(256, dtype=np.float32)
+        profile = np.linspace(0.9, 1.1, 256, dtype=np.float32)
+    else:
+        # Widget emits values in [0, 5], used directly as multiplier
+        profile = profile.astype(np.float32)
+        profile = np.clip(profile, 0.0, 5.0)
 
-    rays, origins, v_min, v_range, sin_a, cos_a = camera.compute_rays(out_w, out_h)
+    rays, origins = camera.compute_rays(out_w, out_h)
+    sin_a = camera.sin_a
+    cos_a = camera.cos_a
+    max_forward_dist = camera.max_forward_dist
     z_base = camera._z_base
 
     out_depth = np.zeros((out_h, out_w), dtype=np.float32)
@@ -294,8 +313,7 @@ def raymarch(stack, camera, out_w, out_h, quality_tier="settled"):
         soil_lut,
         profile.astype(np.float32),
         rays, origins,
-        v_min, v_range, sin_a, cos_a,
-        camera.state.cx, camera.state.cy, z_base,
+        sin_a, cos_a, max_forward_dist, z_base,
         out_w, out_h,
         dem_x0, dem_y0, res,
         dem_H, dem_W,
