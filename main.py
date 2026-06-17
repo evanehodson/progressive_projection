@@ -1,75 +1,50 @@
 import sys
 import math
 import numpy as np
-from PyQt5 import QtWidgets, QtCore
-from pyvistaqt import QtInteractor
+from PyQt5 import QtWidgets, QtCore, QtGui
 
-from pipeline import CartographicPipeline
+from camera import BerannCamera, CameraState
+from raster_stack import RasterStack
+from raymarch import raymarch
+from compositor import compose_viewport, gbuffer_to_qimage
 from widgets_map import MinimapWidget
 from widgets_curves import DeformationControls
 from widgets_layer import GISLayerTreeWidget
 
-class ViewportProgressOverlay(QtWidgets.QWidget):
+DEM_PATH = "../data/wurl/processed_dem.tif"
+SHADOW_PATH = "../data/wurl/shadow_ao.tif"
+LC_PATH = "../data/wurl/unified_landcover.tif"
+SOIL_PATH = "../data/wurl/aligned_soil_raster.tif"
+
+
+class ViewportWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
-        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
-        
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(40, 0, 40, 50)
-        layout.setAlignment(QtCore.Qt.AlignBottom | QtCore.Qt.AlignHCenter)
-        
-        self.pbar = QtWidgets.QProgressBar(self)
-        self.pbar.setFixedSize(400, 20)
-        self.pbar.setTextVisible(False)
-        self.pbar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #334155;
-                border-radius: 4px;
-                background-color: #1e293b;
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                background-color: #10b981;
-                border-radius: 3px;
-            }
-        """)
-        
-        layout.addWidget(self.pbar)
-        self.hide()
+        self.setMinimumSize(200, 200)
+        self._image = None
 
-    def set_value(self, val):
-        self.pbar.setValue(val)
+    def set_image(self, rgba):
+        self._image = QtGui.QImage(rgba.data, rgba.shape[1], rgba.shape[0],
+                                   QtGui.QImage.Format_RGBA8888).copy()
+        self.update()
 
-    def update_position(self):
-        if self.parent():
-            self.setGeometry(0, 0, self.parent().width(), self.parent().height())
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        if self._image is not None and not self._image.isNull():
+            painter.drawImage(self.rect(), self._image)
+        else:
+            painter.fillRect(self.rect(), QtGui.QColor("#1e293b"))
+            painter.setPen(QtGui.QColor("#475569"))
+            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "No render")
 
-class MeshLoadWorker(QtCore.QThread):
-    progressChanged = QtCore.pyqtSignal(int, str)
-    finished = QtCore.pyqtSignal(bool, str)
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
 
-    def __init__(self, pipeline, file_path, plotter):
-        super().__init__()
-        self.pipeline = pipeline
-        self.file_path = file_path
-        self.plotter = plotter
-
-    def run(self):
-        try:
-            self.pipeline.load_mesh(
-                self.file_path, 
-                self.plotter, 
-                progress_callback=self.progressChanged.emit
-            )
-            self.finished.emit(True, "Success")
-        except Exception as e:
-            self.finished.emit(False, str(e))
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Heinrich Berann Cartographic Projection Studio")
+        self.setWindowTitle("Berann 2.5D Studio")
         self.resize(1500, 950)
         self.setStyleSheet("""
             QMainWindow { background-color: #0f172a; color: #f8fafc; }
@@ -82,19 +57,35 @@ class MainWindow(QtWidgets.QMainWindow):
             QComboBox { background-color: #1e293b; color: #f8fafc; border: 1px solid #334155; border-radius: 4px; padding: 4px; }
         """)
 
-        self.pipeline = CartographicPipeline()
         self._block_updates = False
-        self.worker = None
-        self._settle_in_progress = False
-        self._current_warp_profile = None
-        self._update_settled_timer = QtCore.QTimer()
-        self._update_settled_timer.setSingleShot(True)
-        self._update_settled_timer.timeout.connect(self._on_active_updates_settled)
-
         self._camera_azimuth = 0.0
         self._camera_fov = 30.0
         self._drag_start = None
-        
+        self._current_warp_profile = None
+        self._settle_in_progress = False
+        self._gbuffer_cache = None
+
+        self._update_settled_timer = QtCore.QTimer()
+        self._update_settled_timer.setSingleShot(True)
+        self._update_settled_timer.timeout.connect(self._on_settled)
+
+        # --- RASTER STACK ---
+        print("Loading raster stack...", flush=True)
+        self.stack = RasterStack(DEM_PATH, SHADOW_PATH, LC_PATH, SOIL_PATH)
+
+        # --- CAMERA ---
+        self.camera = BerannCamera(
+            self.stack.x_min, self.stack.x_max,
+            self.stack.y_min, self.stack.y_max
+        )
+
+        z_base = self.stack.get_elevation_at(
+            (self.stack.x_min + self.stack.x_max) / 2.0,
+            (self.stack.y_min + self.stack.y_max) / 2.0
+        )
+        self.camera.update(CameraState(), z_base=z_base)
+
+        # --- UI ---
         main_widget = QtWidgets.QWidget()
         self.setCentralWidget(main_widget)
         layout = QtWidgets.QHBoxLayout(main_widget)
@@ -105,35 +96,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar_layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.sidebar)
 
-        self.plotter_container = QtWidgets.QWidget()
-        plotter_layout = QtWidgets.QGridLayout(self.plotter_container)
-        plotter_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.plotter = QtInteractor(self.plotter_container)
-        self.plotter.set_background("#1e293b")
-        if self.plotter.iren.get_interactor_style() is not None:
-            self.plotter.iren.get_interactor_style().SetEnabled(False)
-        self.plotter.installEventFilter(self)
-            
-        plotter_layout.addWidget(self.plotter, 0, 0)
-        layout.addWidget(self.plotter_container)
-
-        self.loading_overlay = ViewportProgressOverlay(self.plotter_container)
+        # Viewport
+        self.viewport = ViewportWidget()
+        self.viewport.installEventFilter(self)
+        layout.addWidget(self.viewport, 1)
 
         self.create_menu_bar()
         self.build_ui()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.loading_overlay.update_position()
+        # Initial render
+        self._render_viewport(quality="settled")
+
+    # ---- Event handling ----
 
     def eventFilter(self, obj, event):
-        if obj == self.plotter:
+        if obj == self.viewport:
             if event.type() == QtCore.QEvent.Wheel:
                 delta = event.angleDelta().y()
                 self._camera_fov = max(5.0, min(120.0, self._camera_fov - delta / 120 * 2))
-                self.plotter.camera.SetViewAngle(self._camera_fov)
-                self.plotter.render()
+                self.route_updates(interactive=True)
                 return True
             elif event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
                 self._drag_start = event.pos()
@@ -147,245 +128,170 @@ class MainWindow(QtWidgets.QMainWindow):
                     if abs(new_az - self._camera_azimuth) > 0.01:
                         self._camera_azimuth = new_az
                         self.minimap.set_view_angle(self._camera_azimuth)
-                        self.route_hardware_updates()
+                        self.route_updates(interactive=True)
                     return True
             elif event.type() == QtCore.QEvent.MouseButtonRelease:
                 self._drag_start = None
                 return True
         return super().eventFilter(obj, event)
 
-    def _update_camera(self):
-        if not self.pipeline.mesh:
-            return
-        cx, cy = self.minimap.get_mesh_coords()
-        xmin, xmax, ymin, ymax, zmin, zmax = self.pipeline.mesh.bounds
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
 
-        pts = self.pipeline.lightweight_points
-        if pts is None or len(pts) == 0:
-            z_base = (zmin + zmax) / 2.0
-        else:
-            center_idx = np.argmin((pts[:, 0] - cx)**2 + (pts[:, 1] - cy)**2)
-            z_base = pts[center_idx, 2]
-
-        height_factor = float(self.curves.alt_slider.value() / 100.0)
-        if height_factor <= 0: height_factor = 0.1
-        diagonal = np.sqrt((xmax - xmin)**2 + (ymax - ymin)**2)
-        height = z_base + diagonal * height_factor
-
-        el_rad = math.radians(float(self.curves.tilt_slider.value()))
-        az_rad = math.radians(self._camera_azimuth)
-
-        if el_rad > 0.01:
-            cot_el = math.cos(el_rad) / math.sin(el_rad)
-            look_dist_h = (height - z_base) * cot_el
-            focal_x = cx + look_dist_h * math.sin(az_rad)
-            focal_y = cy + look_dist_h * math.cos(az_rad)
-            focal_z = z_base
-        else:
-            focal_x = cx + 10000 * math.sin(az_rad)
-            focal_y = cy + 10000 * math.cos(az_rad)
-            focal_z = z_base
-
-        self.plotter.camera.position = (cx, cy, height)
-        self.plotter.camera.focal_point = (focal_x, focal_y, focal_z)
-        self.plotter.camera.up = (0.0, 0.0, 1.0)
-        self.plotter.camera.clipping_range = (0.1, 100000.0)
-        self.plotter.camera.SetViewAngle(self._camera_fov)
+    # ---- UI ----
 
     def create_menu_bar(self):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
-
-        self.import_action = QtWidgets.QAction("&Import Packed Face PLY...", self)
-        self.import_action.setShortcut("Ctrl+I")
-        self.import_action.triggered.connect(self.on_load_mesh)
-        
-        self.export_action = QtWidgets.QAction("&Export Multi-Pass Masks...", self)
-        self.export_action.setShortcut("Ctrl+E")
-        self.export_action.setEnabled(False)  
-        self.export_action.triggered.connect(self.on_export_masks)
-
-        exit_action = QtWidgets.QAction("&Exit Studio Window", self)
+        export_action = QtWidgets.QAction("&Export G-Buffer...", self)
+        export_action.setShortcut("Ctrl+E")
+        export_action.triggered.connect(self._on_export)
+        file_menu.addAction(export_action)
+        exit_action = QtWidgets.QAction("&Exit", self)
         exit_action.triggered.connect(self.close)
-
-        file_menu.addAction(self.import_action)
-        file_menu.addAction(self.export_action)
-        file_menu.addSeparator()
         file_menu.addAction(exit_action)
 
     def build_ui(self):
         map_group = QtWidgets.QGroupBox("Focal Alignment Map")
         map_layout = QtWidgets.QVBoxLayout(map_group)
         self.minimap = MinimapWidget()
-        self.minimap.centerChanged.connect(self.route_hardware_updates)
+        self.minimap.centerChanged.connect(lambda: self.route_updates(interactive=True))
         map_layout.addWidget(self.minimap)
         self.sidebar_layout.addWidget(map_group)
+
+        # Feed DEM to minimap
+        self._init_minimap()
 
         warp_group = QtWidgets.QGroupBox("Deformation & View Controls")
         warp_layout = QtWidgets.QVBoxLayout(warp_group)
         self.curves = DeformationControls()
         self.curves.warpProfileChanged.connect(self._on_warp_profile)
-        self.curves.alt_slider.valueChanged.connect(self.route_hardware_updates)
-        self.curves.tilt_slider.valueChanged.connect(self.route_hardware_updates)
+        self.curves.alt_slider.valueChanged.connect(lambda: self.route_updates(interactive=True))
+        self.curves.tilt_slider.valueChanged.connect(lambda: self.route_updates(interactive=True))
         warp_layout.addWidget(self.curves)
         self.sidebar_layout.addWidget(warp_group)
-        
-        layer_group = QtWidgets.QGroupBox("Active Rendering Layer Attribute")
+
+        # Calibrate ranges
+        self.curves.calibrate_ranges(self.camera.diagonal)
+        self._current_warp_profile = self.curves.curve_editor._sample_curve() * (self.camera.diagonal * 0.25)
+
+        layer_group = QtWidgets.QGroupBox("Active Rendering Layer")
         layer_layout = QtWidgets.QVBoxLayout(layer_group)
-        self.layer_tree = GISLayerTreeWidget(self.pipeline, self.plotter)
-        self.layer_tree.layerChanged.connect(self.on_layer_changed)
+        self.layer_tree = GISLayerTreeWidget(None, None)
+        self.layer_tree.layerChanged.connect(self._on_layer_changed)
         layer_layout.addWidget(self.layer_tree)
         self.sidebar_layout.addWidget(layer_group)
-        
         self.sidebar_layout.addStretch()
 
-    def on_load_mesh(self):
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Target Geometry PLY", "", "PLY Meshes (*.ply)")
-        if not file_path: return
-        
-        self.import_action.setEnabled(False)
-        self.export_action.setEnabled(False)
-        
-        self.loading_overlay.set_value(0)
-        self.loading_overlay.update_position()
-        self.loading_overlay.show()
+    def _init_minimap(self):
+        dem = self.stack.dem_filled
+        H, W = dem.shape
+        stride = max(1, H // 256, W // 256)
+        rows = np.arange(0, H, stride)
+        cols_arr = np.arange(0, W, stride)
+        g_rows, g_cols = np.meshgrid(rows, cols_arr, indexing='ij')
+        n = g_rows.size
+        pts = np.empty((n, 3), dtype=np.float64)
+        pts[:, 0] = self.stack.x_min + g_cols.ravel() * self.stack.res
+        pts[:, 1] = self.stack.y_max - g_rows.ravel() * self.stack.res
+        pts[:, 2] = dem[g_rows, g_cols].ravel()
+        self.minimap.compute_dem_from_downsampled(pts)
 
-        self.worker = MeshLoadWorker(self.pipeline, file_path, self.plotter)
-        self.worker.progressChanged.connect(self.handle_worker_progress)
-        self.worker.finished.connect(self.handle_worker_finished)
-        self.worker.start()
+    # ---- Rendering ----
 
-    def handle_worker_progress(self, percent, message):
-        self.loading_overlay.set_value(percent)
-
-    def handle_worker_finished(self, success, error_message):
-        self.loading_overlay.set_value(100)
-        
-        if not success:
-            QtWidgets.QMessageBox.critical(self, "Pipeline Load Failure", f"An error occurred during disk streaming:\n\n{error_message}")
-            self.import_action.setEnabled(True)
-            self.loading_overlay.hide()
+    def _render_viewport(self, quality="settled"):
+        vp_w = self.viewport.width()
+        vp_h = self.viewport.height()
+        if vp_w < 10 or vp_h < 10:
             return
 
-        QtWidgets.QApplication.processEvents()
+        if quality == "interactive":
+            out_w = vp_w // 2
+            out_h = vp_h // 2
+            tier = "interactive"
+        else:
+            out_w = vp_w
+            out_h = vp_h
+            tier = "settled"
 
-        try:
-            self.minimap.compute_dem_from_downsampled(self.pipeline.lightweight_points)
-            
-            xmin, xmax, ymin, ymax, zmin, zmax = self.pipeline.mesh.bounds
+        if self._current_warp_profile is None:
+            return
 
-            diagonal = np.sqrt((xmax - xmin)**2 + (ymax - ymin)**2)
-            
-            self._block_updates = True
-            self.curves.calibrate_ranges(diagonal)
-            self._block_updates = False
+        state = CameraState(
+            cx=self.minimap.get_mesh_coords()[0],
+            cy=self.minimap.get_mesh_coords()[1],
+            azimuth=self._camera_azimuth,
+            tilt=self.curves.tilt_slider.value(),
+            height_factor=self.curves.alt_slider.value() / 100.0,
+            fov=self._camera_fov,
+            profile=self._current_warp_profile,
+        )
 
-            self.pipeline.mesh_actor = self.plotter.add_mesh(
-                self.pipeline.mesh,
-                show_scalar_bar=False,
-                rgb=False,
-                scalars="Hillshade"
-            )
+        z_base = self.stack.get_elevation_at(state.cx, state.cy)
+        self.camera.update(state, z_base=z_base)
 
-            prop = self.pipeline.mesh_actor.GetProperty()
-            prop.SetLighting(True)
-            prop.SetAmbient(1.0)
-            prop.SetDiffuse(0.0)
-            prop.SetSpecular(0.0)
-            prop.BackfaceCullingOff()
-            prop.FrontfaceCullingOff()
-            prop.SetInterpolationToGouraud()
+        gbuffer = raymarch(self.stack, self.camera, out_w, out_h, quality_tier=tier)
+        self._gbuffer_cache = gbuffer
 
-            self.pipeline.update_hardware_lut()
+        rgba = compose_viewport(gbuffer)
+        self.viewport.set_image(rgba)
 
-            # Create proxy mesh in main thread (VTK threading safety)
-            self.loading_overlay.set_value(95)
-            self.loading_overlay.show()
-            QtWidgets.QApplication.processEvents()
-            self.pipeline._create_proxy_mesh(divisions=200)
-            QtWidgets.QApplication.processEvents()
-
-            # Pre-seed warp buffers for both proxy and full mesh
-            seed_profile = np.zeros(256, dtype=np.float32)
-            self.pipeline._warp_proxy_cpu(0.0, 0.0, 0.0, seed_profile)
-            self.pipeline._warp_mesh_cpu(0.0, 0.0, 0.0, seed_profile)
-
-            self.plotter.reset_camera()
-            
-            self.route_hardware_updates()
-
-        except Exception as rendering_err:
-            import traceback
-            traceback.print_exc()
-            QtWidgets.QMessageBox.critical(self, "GPU Mapping Error", f"Failed to instantiate render properties:\n\n{rendering_err}")
-
-        self.import_action.setEnabled(True)
-        self.export_action.setEnabled(True)
-        self.loading_overlay.hide()
-
-    def on_layer_changed(self, idx):
-        if self._block_updates or not self.pipeline.mesh or not self.pipeline.mesh_actor: return
-        self.pipeline.update_hardware_lut(idx)
-        self.plotter.render()
+    # ---- Callbacks ----
 
     def _on_warp_profile(self, profile):
         self._current_warp_profile = profile
-        self.route_hardware_updates()
+        self.route_updates(interactive=True)
 
-    def route_hardware_updates(self, *args):
-        if self._block_updates or not self.pipeline.mesh or not self.pipeline.mesh_actor:
+    def route_updates(self, interactive=False):
+        if self._block_updates:
             return
+        if interactive:
+            self._render_viewport(quality="interactive")
+        else:
+            self._render_viewport(quality="settled")
+        self._update_settled_timer.start(400)
 
-        import traceback
-        try:
-            cx, cy = self.minimap.get_mesh_coords()
-            view_angle = self._camera_azimuth
-            profile = self._current_warp_profile
-            if profile is None:
-                return
-
-            self.pipeline._warp_proxy_cpu(cx, cy, view_angle, profile)
-            if not self.pipeline._using_proxy:
-                self.pipeline.swap_to_proxy()
-
-            self.pipeline.mesh_actor.GetShaderProperty().ClearAllShaderReplacements()
-
-            self._update_camera()
-            self.minimap.set_view_angle(self._camera_azimuth)
-
-            self.pipeline.mesh_actor.Modified()
-            self.plotter.render()
-            self._update_settled_timer.start(400)
-
-        except Exception as e:
-            traceback.print_exc()
-
-    def _on_active_updates_settled(self):
-        if self._settle_in_progress or not self.pipeline.mesh or not self.pipeline.mesh_actor:
+    def _on_settled(self):
+        if self._settle_in_progress:
             return
         self._settle_in_progress = True
         try:
-            if self._block_updates:
-                return
-
-            cx, cy = self.minimap.get_mesh_coords()
-            view_angle = self._camera_azimuth
-            profile = self._current_warp_profile
-            if profile is None:
-                return
-
-            self.pipeline._warp_mesh_cpu(cx, cy, view_angle, profile)
-            self.pipeline.swap_to_full()
-            self.plotter.render()
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
+            self._render_viewport(quality="settled")
         finally:
             self._settle_in_progress = False
 
-    def on_export_masks(self):
-        self.pipeline.execute_multipass_export(self.plotter, base_filename="berann_export")
+    def _on_layer_changed(self, idx):
+        pass
+
+    def _on_export(self):
+        if self._current_warp_profile is None or self._gbuffer_cache is None:
+            return
+
+        export_w = 16384
+        export_h = 8192
+
+        state = CameraState(
+            cx=self.minimap.get_mesh_coords()[0],
+            cy=self.minimap.get_mesh_coords()[1],
+            azimuth=self._camera_azimuth,
+            tilt=self.curves.tilt_slider.value(),
+            height_factor=self.curves.alt_slider.value() / 100.0,
+            fov=self._camera_fov,
+            profile=self._current_warp_profile,
+        )
+        z_base = self.stack.get_elevation_at(state.cx, state.cy)
+        self.camera.update(state, z_base=z_base)
+
+        print(f"Exporting G-buffer at {export_w}x{export_h}...", flush=True)
+        gbuffer = raymarch(self.stack, self.camera, export_w, export_h, quality_tier="export")
+        rgba = compose_viewport(gbuffer)
+
+        from PIL import Image
+        img = Image.frombuffer("RGBA", (export_w, export_h), rgba, "raw", "RGBA", 0, 1)
+        img.save("berann_export_viewport.png")
+        print("Exported: berann_export_viewport.png", flush=True)
+        self._gbuffer_cache = gbuffer
+
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
